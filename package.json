@@ -1,0 +1,16 @@
+{
+  "name": "judici-a-mvp",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node --watch src/server.js",
+    "dev:backend": "node --watch src/server.js",
+    "dev:frontend": "node scripts/dev-frontend.mjs",
+    "users": "node scripts/manage-users.mjs",
+    "seed:glpi-knowledge": "node scripts/seed-glpi-knowledge.mjs",
+    "evaluate:classifier": "node scripts/evaluate-classifier.mjs"
+  },
+  "dependencies": {}
+}
