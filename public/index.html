@@ -3,15 +3,14 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <meta name="theme-color" content="#102d45" />
+    <meta name="theme-color" content="#0b57d0" />
     <title>JUDICI.A — Suporte TIC</title>
     <link rel="stylesheet" href="styles.css" />
   </head>
   <body>
     <section class="auth-screen" id="auth-screen" aria-labelledby="auth-title">
       <div class="auth-card">
-        <div class="brand-mark" aria-hidden="true">J</div>
-        <div class="eyebrow"><span class="eyebrow-line"></span> JUDICI.A · SUPORTE TIC</div>
+        <div class="eyebrow"></span> JUDICI.A · SUPORTE TIC</div>
         <h1 id="auth-title">Acesse sua conta</h1>
         <p>Entre com a conta fornecida pela administração do sistema.</p>
         <form id="login-form" autocomplete="on">
@@ -57,6 +56,9 @@
           </button>
           <button class="nav-item" data-view="pilot" data-roles="tic,gestor">
             <span class="nav-icon">◷</span>Piloto e SLAs
+          </button>
+          <button class="nav-item" data-view="users" data-roles="gestor">
+            <span class="nav-icon">âœ‰</span>Acessos
           </button>
           <button class="nav-item" data-view="triage-settings" data-roles="tic">
             <span class="nav-icon">⚙</span>Configuração da triagem
@@ -127,7 +129,8 @@
               placeholder="Ex.: Não consigo acessar o PJe desde esta manhã. Aparece uma mensagem de erro quando tento entrar."
             ></textarea>
             <label class="request-locality-label" for="locality">Comarca ou município</label>
-            <input id="locality" name="locality" maxlength="120" required autocomplete="address-level2" placeholder="Ex.: Belém, Santarém ou Marabá" />
+            <select id="locality" name="locality" required aria-describedby="locality-help"><option value="">Selecione sua comarca ou município</option></select>
+            <small id="locality-help" class="request-locality-help">Se sua localidade não estiver na lista, procure o gestor do sistema para cadastrá-la.</small>
             <div class="form-footer">
               <span id="char-count">0 / 1000</span
               ><button id="analyze-button" class="button button-primary">
@@ -197,6 +200,7 @@
         <section class="view" id="view-triage-settings"></section>
         <section class="view" id="view-integration"></section>
         <section class="view" id="view-detail"></section>
+        <section class="view" id="view-users"></section>
         <footer class="app-footer">
           <span>JUDICI.A <span class="footer-sep">·</span> Protótipo de suporte inteligente</span
           ><span
@@ -208,6 +212,6 @@
       <div id="toast" class="toast" role="status" aria-live="polite"></div>
     </div>
     <script src="js/api.js"></script>
-    <script src="app.js"></script>
+    <script type="module" src="app.js"></script>
   </body>
 </html>

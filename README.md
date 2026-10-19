@@ -13,13 +13,13 @@ Aplicação web demonstrativa para triagem e autoatendimento, com interface sepa
 
 ## Contas e perfis de acesso
 
-O sistema não possui cadastro público. Depois de iniciar a API pela primeira vez (para criar as tabelas), abra outro terminal na pasta do projeto e execute `npm run users -- create`. Informe e-mail, nome, perfil (`solicitante`, `tic` ou `gestor`) e uma senha com pelo menos 12 caracteres. Crie a primeira conta com perfil `gestor`; depois, use o mesmo comando para cadastrar as demais pessoas. As senhas são armazenadas como derivados `scrypt`, e a aplicação usa sessões no servidor em cookies `HttpOnly`.
+O sistema não possui cadastro público. Depois de iniciar a API pela primeira vez (para criar as tabelas), abra outro terminal na pasta do projeto e execute `npm run users -- create`. Informe e-mail, nome, perfil (`solicitante`, `tic` ou `gestor`) e uma senha com pelo menos 12 caracteres. Crie a primeira conta com perfil `gestor`; depois, essa pessoa pode criar contas e atribuir perfis pela tela **Acessos**. As senhas são armazenadas como derivados `scrypt`, e a aplicação usa sessões no servidor em cookies `HttpOnly`.
 
 - **Solicitante:** atendimento, autoatendimento e consulta/avaliação dos próprios chamados.
 - **Equipe de TIC (`tic`):** atendimento completo, triagem, qualidade, incidentes e configuração das integrações e do piloto.
 - **Gestor (`gestor`):** painéis, chamados e incidentes para acompanhamento, além de leitura das metas do piloto.
 
-Administre contas pelo terminal: `npm run users -- reset-password email@instituicao.gov.br` redefine a senha e encerra sessões; `npm run users -- set-role email@instituicao.gov.br tic` troca o perfil e encerra sessões. Não existe recuperação de senha pela interface. Em implantação HTTPS, configure `SESSION_COOKIE_SECURE=true` no `.env`; mantenha `FRONTEND_ORIGINS` limitado aos endereços da interface. Esta autenticação local não integra diretório institucional nem substitui SSO.
+Para recuperação administrativa, `npm run users -- reset-password email@instituicao.gov.br` redefine a senha e encerra sessões; `npm run users -- set-role email@instituicao.gov.br tic` troca o perfil pelo terminal. Não existe recuperação de senha pela interface. A tela **Acessos** permite gestores criarem contas e mudarem os perfis; alterar um perfil encerra as sessões dessa pessoa. Em implantação HTTPS, configure `SESSION_COOKIE_SECURE=true` no `.env`; mantenha `FRONTEND_ORIGINS` limitado aos endereços da interface. Esta autenticação local não integra diretório institucional nem substitui SSO.
 
 Para usar Laya local, instale e inicie o servidor Laya em `127.0.0.1:8000` conforme as instruções do projeto Laya. Na primeira análise, o modelo poderá ser baixado do Hugging Face. Sem provedor configurado, a API usa o classificador local demonstrativo.
 
@@ -30,7 +30,16 @@ Para usar Laya local, instale e inicie o servidor Laya em `127.0.0.1:8000` confo
 ```text
 public/                 Interface web
   js/api.js             Cliente HTTP do navegador
-  app.js                Renderização e interações da interface
+  app.js                Sessão, estado compartilhado, navegação e ações
+  pages/                Módulos de interface separados por tela/domínio
+    requests.js         Atendimento, análise e autoatendimento
+    tickets.js          Painel, chamados e incidentes
+    ticket-detail.js    Detalhes e status do chamado
+    quality.js          Qualidade da triagem
+    triage-settings.js  Configuração e prévia da triagem
+    pilot.js            Períodos, SLAs e sincronização
+    integration.js      Configuração e estado do GLPI
+    user-management.js  Criação de contas e atribuição de perfis
   index.html
   styles.css
 src/

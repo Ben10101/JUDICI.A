@@ -12,6 +12,9 @@ import {
   sessionCookie,
   verifyCsrfToken,
   verifyUserCredentials,
+  createUser,
+  listUsers,
+  updateManagedUserRole,
 } from './auth.js';
 import { classifyWithProvider } from './decision-provider.js';
 import { evaluateSavedFeedbackCases } from './quality-evaluation.js';
@@ -35,6 +38,10 @@ import {
   redactEvaluationText,
   requestOwnedBy,
   ticketOwnedBy,
+  listServiceLocalities,
+  createServiceLocality,
+  setServiceLocalityActive,
+  serviceLocalityIsActive,
 } from './repository.js';
 import {
   applyAutomationGate,
@@ -116,6 +123,12 @@ function roleCanAccess(user, pathname, method) {
   }
 
   if (role === 'gestor') {
+    if (method === 'GET' && pathname === '/api/admin/users') return true;
+    if (method === 'GET' && pathname === '/api/admin/localities') return true;
+    if (method === 'POST' && pathname === '/api/admin/users') return true;
+    if (method === 'POST' && pathname === '/api/admin/localities') return true;
+    if (method === 'PUT' && /^\/api\/admin\/users\/[0-9a-f-]+\/role$/i.test(pathname)) return true;
+    if (method === 'PUT' && /^\/api\/admin\/localities\/\d+\/status$/.test(pathname)) return true;
     if (method === 'GET' && ['/api/dashboard', '/api/tickets', '/api/incidents', '/api/pilot/settings', '/api/pilot/metrics'].includes(pathname)) return true;
     if (method === 'GET' && /^\/api\/tickets\/[^/]+(?:\/status)?$/.test(pathname)) return true;
     if (method === 'GET' && /^\/api\/incidents\/[^/]+$/.test(pathname)) return true;
@@ -311,6 +324,53 @@ export async function handle(req, res) {
     }
     if (url.pathname === '/api/bootstrap' && req.method === 'GET')
       return send(res, 200, bootstrap(user));
+    if (url.pathname === '/api/admin/users' && req.method === 'GET')
+      return send(res, 200, listUsers());
+    if (url.pathname === '/api/admin/localities' && req.method === 'GET')
+      return send(res, 200, listServiceLocalities(true));
+    if (url.pathname === '/api/admin/localities' && req.method === 'POST') {
+      try {
+        const { name } = await bodyJson(req);
+        return send(res, 201, createServiceLocality(name));
+      } catch (error) {
+        const duplicate = /service_localities_name_lower_uidx|duplicate key/i.test(error.message);
+        return send(res, 400, { error: duplicate ? 'Esse município ou comarca já está cadastrado.' : error.message || 'Não foi possível cadastrar o município ou comarca.' });
+      }
+    }
+    const localityStatusMatch = url.pathname.match(/^\/api\/admin\/localities\/(\d+)\/status$/);
+    if (localityStatusMatch && req.method === 'PUT') {
+      try {
+        const { active } = await bodyJson(req);
+        if (typeof active !== 'boolean') return send(res, 400, { error: 'Informe se o município ou comarca ficará ativo.' });
+        return send(res, 200, setServiceLocalityActive(localityStatusMatch[1], active));
+      } catch (error) {
+        return send(res, 400, { error: error.message || 'Não foi possível atualizar o cadastro.' });
+      }
+    }
+    if (url.pathname === '/api/admin/users' && req.method === 'POST') {
+      try {
+        const body = await bodyJson(req);
+        const created = await createUser({
+          email: body.email,
+          displayName: body.displayName,
+          role: body.role,
+          password: body.password,
+        });
+        return send(res, 201, created);
+      } catch (error) {
+        return send(res, 400, { error: error.message || 'Não foi possível criar a conta.' });
+      }
+    }
+    const managedRoleMatch = url.pathname.match(/^\/api\/admin\/users\/([0-9a-f-]+)\/role$/i);
+    if (managedRoleMatch && req.method === 'PUT') {
+      try {
+        const body = await bodyJson(req);
+        const updated = updateManagedUserRole(managedRoleMatch[1], body.role, user.id);
+        return send(res, 200, updated);
+      } catch (error) {
+        return send(res, 400, { error: error.message || 'Não foi possível alterar o perfil.' });
+      }
+    }
     if (url.pathname === '/api/dashboard' && req.method === 'GET')
       return send(res, 200, dashboard());
     if (url.pathname === '/api/quality' && req.method === 'GET')
@@ -408,6 +468,8 @@ export async function handle(req, res) {
         return send(res, 400, { error: 'A descrição deve ter entre 8 e 1000 caracteres.' });
       if (locality.length < 2 || locality.length > 120)
         return send(res, 400, { error: 'Informe a comarca ou município (2 a 120 caracteres).' });
+      if (!serviceLocalityIsActive(locality))
+        return send(res, 400, { error: 'Selecione uma comarca ou município ativo na lista.' });
       const evaluated = await classifyWithProvider(description, getTriageQuestionSettings()),
         calibratedDecision = calibrateDecision(description, evaluated.decision);
       const calibrated = {

@@ -115,6 +115,36 @@ export function updateUserRole(email, role) {
   );
 }
 
+export function listUsers() {
+  ensureAuthSchema();
+  return queryJson(`SELECT coalesce(json_agg(x ORDER BY x."displayName"),'[]'::json) FROM (
+    SELECT id,email,display_name AS "displayName",role,active,created_at AS "createdAt"
+    FROM app_users ORDER BY display_name,email
+  ) x`);
+}
+
+export function updateManagedUserRole(userId, role, actorId) {
+  const normalizedRole = String(role || '').trim().toLowerCase();
+  if (!validRoles.has(normalizedRole))
+    throw new Error('Perfil inválido. Use solicitante, tic ou gestor.');
+  const currentRole = query(
+    `SELECT role FROM app_users WHERE id=${sqlValue(userId)}::uuid AND active=true LIMIT 1`,
+  );
+  if (!currentRole) throw new Error('Conta ativa não encontrada.');
+  if (userId === actorId) throw new Error('Por segurança, não altere o próprio perfil.');
+  if (currentRole === 'gestor' && normalizedRole !== 'gestor') {
+    const otherManagers = Number(query(
+      `SELECT count(*) FROM app_users WHERE active=true AND role='gestor' AND id<>${sqlValue(userId)}::uuid`,
+    ));
+    if (otherManagers < 1) throw new Error('O sistema precisa manter ao menos um gestor ativo.');
+  }
+  query(
+    `UPDATE app_users SET role=${sqlValue(normalizedRole)} WHERE id=${sqlValue(userId)}::uuid AND active=true`,
+  );
+  query(`DELETE FROM app_sessions WHERE user_id=${sqlValue(userId)}::uuid`);
+  return { id: userId, role: normalizedRole };
+}
+
 export async function verifyUserCredentials(email, password) {
   const normalizedEmail = normalizeEmail(email);
   const user = queryJson(

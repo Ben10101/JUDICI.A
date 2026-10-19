@@ -35,7 +35,9 @@ ALTER TABLE tickets ADD COLUMN IF NOT EXISTS status_synced_at timestamptz;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS glpi_category_id integer;
 ALTER TABLE tickets ADD COLUMN IF NOT EXISTS queue_routing text NOT NULL DEFAULT 'SUGGESTED_ONLY';
 CREATE TABLE IF NOT EXISTS evaluation_cases (id bigserial PRIMARY KEY,source_request_id text NOT NULL UNIQUE REFERENCES requests(id) ON DELETE CASCADE,text text NOT NULL,expected jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS app_settings (key text PRIMARY KEY,value jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now());`;
+CREATE TABLE IF NOT EXISTS app_settings (key text PRIMARY KEY,value jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now());
+CREATE TABLE IF NOT EXISTS service_localities (id bigserial PRIMARY KEY,name text NOT NULL,active boolean NOT NULL DEFAULT true,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
+CREATE UNIQUE INDEX IF NOT EXISTS service_localities_name_lower_uidx ON service_localities(lower(name));`;
 
 const seedArticles = [
   {
@@ -451,6 +453,26 @@ export function listIncidents() {
     `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT i.code AS id,i.code,i.title,i.system,i.category,i.severity,i.status,i.detected_at AS "detectedAt",coalesce((SELECT json_agg(it.ticket_id) FROM incident_tickets it WHERE it.incident_code=i.code),'[]'::json) AS "ticketIds" FROM incidents i ORDER BY detected_at DESC) x`,
   );
 }
+export function listServiceLocalities(includeInactive = false) {
+  return queryJson(`SELECT coalesce(json_agg(x ORDER BY lower(x.name)),'[]'::json) FROM (
+    SELECT id,name,active,created_at AS "createdAt" FROM service_localities ${includeInactive ? '' : 'WHERE active'}
+  ) x`);
+}
+export function serviceLocalityIsActive(name) {
+  return query(`SELECT 1 FROM service_localities WHERE active AND lower(name)=lower(${sqlValue(String(name || '').trim())}) LIMIT 1`) === '1';
+}
+export function createServiceLocality(input) {
+  const name = String(input || '').trim().replace(/\s+/g, ' ');
+  if (name.length < 2 || name.length > 120) throw new Error('Informe um município ou comarca entre 2 e 120 caracteres.');
+  const inserted = queryJson(`INSERT INTO service_localities(name) VALUES(${sqlValue(name)}) RETURNING json_build_object('id',id,'name',name,'active',active,'createdAt',created_at)`, null);
+  return inserted;
+}
+export function setServiceLocalityActive(id, active) {
+  if (!/^\d+$/.test(String(id))) throw new Error('Município ou comarca inválido.');
+  const updated = queryJson(`UPDATE service_localities SET active=${active ? 'true' : 'false'},updated_at=now() WHERE id=${Number(id)} RETURNING json_build_object('id',id,'name',name,'active',active)`, null);
+  if (!updated) throw new Error('Município ou comarca não encontrado.');
+  return updated;
+}
 export function bootstrap(user = null) {
   const requester = user?.role === 'solicitante';
   const tickets = requester ? listTickets(user.id) : listTickets(),
@@ -461,7 +483,7 @@ export function bootstrap(user = null) {
     articles = queryJson(
       `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT id,title,category,system,problem,solution,steps FROM knowledge_articles WHERE active ORDER BY id) x`,
     );
-  return { tickets, incidents, events, articles };
+  return { tickets, incidents, events, articles, localities: listServiceLocalities() };
 }
 export function createIncidentFor(ticket) {
   const related = queryJson(
