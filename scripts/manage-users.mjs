@@ -2,10 +2,11 @@ import { createInterface } from 'node:readline/promises';
 import { stdin, stdout } from 'node:process';
 import {
   createUser,
-  ensureAuthSchema,
   resetUserPassword,
   updateUserRole,
 } from '../src/auth.js';
+import { init, tenantBySlug } from '../src/repository.js';
+import { setTenantContext } from '../src/tenant-context.js';
 
 function askHidden(prompt) {
   if (!stdin.isTTY || typeof stdin.setRawMode !== 'function')
@@ -51,14 +52,20 @@ async function readNewPassword() {
 }
 
 async function main() {
-  ensureAuthSchema();
+  init();
   const [action = 'create', ...args] = process.argv.slice(2);
+  const tenantArgument = args.indexOf('--tenant');
+  const tenantSlug = tenantArgument >= 0 ? args[tenantArgument + 1] : 'default';
+  if (tenantArgument >= 0) args.splice(tenantArgument, 2);
+  const tenant = tenantBySlug(tenantSlug);
+  if (!tenant) throw new Error('Organizacao nao encontrada. Crie-a com npm run tenants -- create.');
+  setTenantContext(tenant.id);
   if (action === 'create') {
     const email = await askVisible('E-mail: ');
     const displayName = await askVisible('Nome exibido: ');
     const role = await askVisible('Perfil (solicitante/tic/gestor): ');
     const password = await readNewPassword();
-    const user = await createUser({ email, displayName, role, password });
+    const user = await createUser({ email, displayName, role, password, tenantId: tenant.id });
     stdout.write(`Conta criada: ${user.email} · perfil ${user.role}\n`);
     return;
   }
@@ -69,7 +76,7 @@ async function main() {
     return;
   }
   if (action === 'set-role') {
-    if (args.length !== 2) throw new Error('Uso: npm run users -- set-role email solicitante|tic|gestor');
+    if (args.length !== 2) throw new Error('Uso: npm run users -- set-role --tenant slug email solicitante|tic|gestor');
     updateUserRole(args[0], args[1]);
     stdout.write('Perfil atualizado; as sessões existentes foram encerradas.\n');
     return;

@@ -6,14 +6,14 @@ import {
   fallbackClassification,
 } from './triage.js';
 
-export async function classifyWithProvider(description, questions) {
+export async function classifyWithProvider(description, questions, policy = {}) {
   const apiKey = process.env.JEVMODEL_API_KEY || '';
   const baseUrl = process.env.JEVMODEL_BASE_URL || '';
-  if (!apiKey && !baseUrl) return fallbackClassification(description);
+  if (!apiKey && !baseUrl) return fallbackClassification(description, policy.calibrationRules, policy.thresholds);
 
   const isLaya = /localhost:8000|127\.0\.0\.1:8000/.test(baseUrl);
   const model = process.env.JEVMODEL_NAME || (isLaya ? 'multilingual' : 'jev-latest');
-  const request = evaluationRequest(description, model, questions);
+  const request = evaluationRequest(description, model, questions, policy.payloadTemplate);
   const headers = { 'Content-Type': 'application/json' };
 
   if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
@@ -40,12 +40,16 @@ export async function classifyWithProvider(description, questions) {
     );
   }
 
-  const decision = decisionFromAnswers(data.answers || {});
+  const decision = decisionFromAnswers(data.answers || {}, policy.calibrationRules, policy.systemOptionMappings, policy.categoryOptionMappings, questions);
   decision.jevUsage = data.usage || null;
   const provider = isLaya ? 'laya' : 'jev';
 
   return {
     decision,
+    modelChoices: {
+      category: String(data.answers?.category?.choice || "").toUpperCase() || null,
+      system: String(data.answers?.system?.choice || "").toUpperCase() || null,
+    },
     provider: `${provider}:${data.routing?.model || data.model || model}`,
     ...assessDecision(decision),
   };

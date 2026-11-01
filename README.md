@@ -1,15 +1,17 @@
 # JUDICI.A — MVP conectado
 
-Aplicação web demonstrativa para triagem e autoatendimento, com interface separada da API Node.js, persistência PostgreSQL e integração opcional com Laya ou Jev.
+Aplicação web demonstrativa para triagem e autoatendimento, com interface separada da API Node.js, persistência MariaDB e integração opcional com Laya ou Jev.
 
 ## Executar localmente no Windows
 
-1. Instale Node.js 20+ e PostgreSQL 16. A API acessa o banco pelo executável `psql`.
-2. Crie o banco `judicia_a` e um usuário com permissão para criar tabelas no schema `public`.
-3. Copie `.env.example` para `.env` e configure as credenciais do PostgreSQL e o provedor de decisões.
-4. Em um terminal, inicie a API: `npm run dev:backend` (porta 3000).
-5. Em outro terminal, inicie a interface: `npm run dev:frontend` (porta 5173).
-6. Abra `http://localhost:5173`. A interface chama a API em `http://localhost:3000`.
+1. Instale Node.js 20+ e Docker Desktop.
+2. Configure `.env` a partir de `.env.example`.
+3. Inicie MariaDB com `docker compose up -d`.
+4. Instale dependencias e inicie API: `npm install` e `npm run dev:backend`.
+5. Inicie o frontend em outro terminal com `npm run dev:frontend`.
+6. Abra `http://localhost:5173`. Consulte [SETUP.md](SETUP.md) para migrar dados do PostgreSQL.
+
+O schema e o historico de banco sao gerenciados pelo Prisma Migrate em `prisma/tenant` e `prisma/registry`. Use `npm run db:migrate` para aplicar migrations pendentes a todas as organizacoes. Consulte [SETUP.md](SETUP.md) para criar migrations e migrar os dados PostgreSQL existentes.
 
 ## Contas e perfis de acesso
 
@@ -47,7 +49,7 @@ src/
   config.js             Ambiente, portas e configuração do banco
   decision-provider.js  Integração com Laya/Jev e fallback local
   ticketing/            Contrato e adaptador simulado do sistema de chamados
-  postgres.js           Consultas PostgreSQL e conversão JSON
+  database.js           Consultas MariaDB e isolamento por organizacao
   repository.js         Schema, inicialização e operações de persistência
   server.js             Rotas HTTP e orquestração da API
   triage.js              Regras puras de classificação e decisão

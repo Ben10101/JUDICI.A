@@ -1,8 +1,6 @@
-import { glpiConfig } from '../config.js';
-
 const REQUEST_TIMEOUT_MS = 12_000;
 
-function requiredConfig() {
+function requiredConfig(glpiConfig) {
   const missing = Object.entries({
     GLPI_API_BASE_URL: glpiConfig.apiBaseUrl,
     GLPI_CLIENT_ID: glpiConfig.clientId,
@@ -15,7 +13,7 @@ function requiredConfig() {
   if (missing.length) throw new Error(`Configuração GLPI incompleta: ${missing.join(', ')}.`);
 }
 
-export function createGlpiV2Client() {
+export function createGlpiV2Client(glpiConfig) {
   let accessToken;
   let tokenExpiresAt = 0;
   let openApiDocument;
@@ -49,7 +47,7 @@ export function createGlpiV2Client() {
   }
 
   async function token() {
-    requiredConfig();
+    requiredConfig(glpiConfig);
     if (accessToken && Date.now() < tokenExpiresAt - 30_000) return accessToken;
     const body = new URLSearchParams({
       grant_type: 'password',

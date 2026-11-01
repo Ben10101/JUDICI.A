@@ -118,6 +118,8 @@ import { triageQuestionLabels } from './pages/triage-labels.js';
   async function reload() {
     const [data, h] = await Promise.all([api('/api/bootstrap'), api('/api/health')]);
     state.cache = data;
+    Object.assign(categoryPt, data.categoryLabels || {});
+    Object.assign(systemPt, data.systemLabels || {});
     const localitySelect = $('#locality');
     const selectedLocality = localitySelect.value;
     localitySelect.replaceChildren(new Option('Selecione sua comarca ou município', ''));
@@ -225,7 +227,7 @@ import { triageQuestionLabels } from './pages/triage-labels.js';
       .join('');
   }
   function reviewForm(d, { hidden = false, requireScope = false } = {}) {
-    return `<section id="correction-form" class="review-form" ${hidden ? 'hidden' : ''}><h3>Revisar classificação</h3><p>Confirme os dados antes de encaminhar. A decisão original do modelo será preservada no histórico.</p>${requireScope ? '<label class="scope-confirm"><input id="confirm-support" type="checkbox"> Confirmo que esta é uma solicitação de suporte de TIC.</label>' : ''}<div class="review-fields"><label class="review-field">Categoria<select id="correction-category">${selectOptions(categoryPt, d.category)}</select></label><label class="review-field">Sistema ou equipamento<select id="correction-system">${selectOptions(systemPt, d.system)}</select></label><label class="review-field">Impacto<select id="correction-impact">${selectOptions(levelPt, d.impact)}</select></label><label class="review-field">Urgência<select id="correction-urgency">${selectOptions(levelPt, d.urgency)}</select></label></div><div class="review-checks"><label><input id="correction-incident" type="checkbox" ${d.possibleIncident ? 'checked' : ''}> Afeta outras pessoas ou serviço compartilhado</label><label><input id="correction-human" type="checkbox" ${d.humanRequired ? 'checked' : ''}> Precisa de atendimento humano</label><label><input id="correction-outage" type="checkbox" ${d.outage ? 'checked' : ''}> Há indisponibilidade</label></div><label class="review-field review-reason">Observação da revisão (opcional)<textarea id="correction-reason" maxlength="500" rows="2" placeholder="Explique brevemente a correção"></textarea></label><div class="action-row"><button class="button button-primary" data-action="save-correction">Salvar revisão</button></div></section>`;
+    return `<section id="correction-form" class="review-form" ${hidden ? 'hidden' : ''}><h3>Revisar classificação</h3><p>Confirme os dados antes de encaminhar. A decisão original do modelo será preservada no histórico.</p>${requireScope ? `<label class="scope-confirm"><input id="confirm-support" type="checkbox"> Confirmo que esta mensagem pertence ao servi\u00e7o ${esc(state.cache?.supportProfile?.serviceName || 'suporte configurado')}.</label>` : ''}<div class="review-fields"><label class="review-field">Categoria<select id="correction-category">${selectOptions(categoryPt, d.category)}</select></label><label class="review-field">Sistema ou equipamento<select id="correction-system">${selectOptions(systemPt, d.system)}</select></label><label class="review-field">Impacto<select id="correction-impact">${selectOptions(levelPt, d.impact)}</select></label><label class="review-field">Urgência<select id="correction-urgency">${selectOptions(levelPt, d.urgency)}</select></label></div><div class="review-checks"><label><input id="correction-incident" type="checkbox" ${d.possibleIncident ? 'checked' : ''}> Afeta outras pessoas ou serviço compartilhado</label><label><input id="correction-human" type="checkbox" ${d.humanRequired ? 'checked' : ''}> Precisa de atendimento humano</label><label><input id="correction-outage" type="checkbox" ${d.outage ? 'checked' : ''}> Há indisponibilidade</label></div><label class="review-field review-reason">Observação da revisão (opcional)<textarea id="correction-reason" maxlength="500" rows="2" placeholder="Explique brevemente a correção"></textarea></label><div class="action-row"><button class="button button-primary" data-action="save-correction">Salvar revisão</button></div></section>`;
   }
   async function saveCorrection() {
     const confirmSupport = $('#confirm-support');
@@ -409,7 +411,7 @@ import { triageQuestionLabels } from './pages/triage-labels.js';
     try {
       const result = await api('/api/auth/login', {
         method: 'POST',
-        body: JSON.stringify({ email: $('#login-email').value, password: $('#login-password').value }),
+        body: JSON.stringify({ tenantSlug: $('#login-tenant').value, email: $('#login-email').value, password: $('#login-password').value }),
       });
       $('#login-form').reset();
       await activateAuthenticatedApp(result.user, result.csrfToken);

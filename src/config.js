@@ -114,12 +114,9 @@ export const frontendOrigins = (
   .filter(Boolean);
 
 export const databaseConfig = Object.freeze({
-  host: process.env.PGHOST || 'localhost',
-  port: process.env.PGPORT || '5432',
-  user: process.env.PGUSER || 'postgres',
-  password: process.env.PGPASSWORD || '',
-  database: process.env.PGDATABASE || 'judicia_a',
-  executable:
-    process.env.PSQL_PATH ||
-    (process.platform === 'win32' ? 'C:\\Program Files\\PostgreSQL\\16\\bin\\psql.exe' : 'psql'),
+  host: process.env.MYSQL_HOST || 'localhost',
+  port: process.env.MYSQL_PORT || '3306',
+  user: process.env.MYSQL_USER || 'judici_app',
+  password: process.env.MYSQL_PASSWORD || '',
+  registryDatabase: process.env.MYSQL_REGISTRY_DATABASE || 'judicia_registry',
 });

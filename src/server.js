@@ -2,6 +2,7 @@ import http from 'node:http';
 import { port as PORT, databaseConfig as DB } from './config.js';
 import { init } from './repository.js';
 import { handle } from './api.js';
+import { runWithTenantContext } from './tenant-context.js';
 
 try {
   init();
@@ -12,7 +13,7 @@ try {
 
 http
   .createServer((request, response) => {
-    void handle(request, response);
+    void runWithTenantContext(() => handle(request, response));
   })
   .listen(PORT, () => {
     const providerStatus = process.env.JEVMODEL_BASE_URL
@@ -20,6 +21,6 @@ http
       : 'sem provedor ? classificador local';
 
     console.log(
-      `JUDICI.A dispon?vel em http://localhost:${PORT} (PostgreSQL ${DB.database}; ${providerStatus})`,
+      `JUDICI.A dispon?vel em http://localhost:${PORT} (MariaDB ${DB.registryDatabase}; ${providerStatus})`,
     );
   });

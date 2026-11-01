@@ -1747,6 +1747,8 @@ td strong {
 .triage-preview-output { margin-top: 14px; padding: 14px; border-radius: 7px; background: #f4f7f8; }
 .triage-preview-head { display: flex; justify-content: space-between; gap: 12px; color: #395a6b; font-size: 11px; }
 .triage-preview-head span { color: #8796a0; font-size: 10px; }
+.triage-preview-mapping { margin: 12px 0 0; padding: 10px 12px; border-left: 3px solid #d39b26; border-radius: 4px; background: #fff8e8; color: #5f522e; font-size: 11px; line-height: 1.5; }
+.triage-preview-mapping span { color: #7b8790; }
 .triage-preview-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px; margin-top: 12px; }
 .triage-preview-grid > div { display: grid; gap: 4px; padding: 10px; border-radius: 5px; background: white; }
 .triage-preview-grid small { color: #93a1a9; font-size: 8px; letter-spacing: .4px; }
@@ -2067,3 +2069,57 @@ tbody tr:hover { background: #f8fafd; }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
 }
+
+.triage-thresholds { padding: 0 0 18px; margin-bottom: 18px; border-bottom: 1px solid #edf1f2; }
+.triage-thresholds h3 { margin: 0 0 5px; color: #395a6b; font-size: 13px; }
+.triage-thresholds > p { margin: 0 0 12px; color: #788995; font-size: 10px; }
+.triage-threshold-field { display: grid; grid-template-columns: minmax(190px, .7fr) minmax(120px, .3fr); gap: 15px; align-items: center; padding: 10px 0; border-top: 1px solid #edf1f2; }
+.triage-threshold-field > span:first-child { display: grid; gap: 4px; color: #395a6b; font-size: 11px; }
+.triage-threshold-field small { color: #8796a0; font-size: 10px; font-weight: 400; }
+.triage-threshold-field > span:last-child { display: flex; align-items: center; gap: 7px; color: #637988; }
+.triage-threshold-field input { width: 88px; padding: 8px; border: 1px solid #dce5e8; border-radius: 5px; color: #355168; font: 11px 'DM Sans'; }
+@media (max-width: 760px) { .triage-threshold-field { grid-template-columns: 1fr; gap: 8px; } }
+
+.triage-routing, .triage-calibration { padding: 16px 0; border-top: 1px solid #edf1f2; }
+.triage-routing h3, .triage-calibration h3 { margin: 0 0 5px; color: #395a6b; font-size: 13px; }
+.triage-routing > p, .triage-calibration > p { margin: 0 0 12px; color: #788995; font-size: 10px; line-height: 1.5; }
+.triage-routing-field { display: grid; grid-template-columns: minmax(190px, .7fr) minmax(150px, .3fr); gap: 15px; align-items: center; padding: 7px 0; color: #637988; font-size: 10px; }
+.triage-routing-field input { min-width: 0; padding: 9px; border: 1px solid #dce5e8; border-radius: 5px; color: #355168; background: white; font: 11px 'DM Sans'; }
+#triage-calibration-rules, #triage-priority-matrix { width: 100%; min-height: 200px; resize: vertical; padding: 10px; border: 1px solid #dce5e8; border-radius: 5px; color: #355168; background: #fbfcfc; font: 11px/1.5 Consolas, monospace; }
+.triage-automation { display: flex; align-items: flex-start; gap: 9px; padding: 12px 0; border-top: 1px solid #edf1f2; color: #395a6b; }
+.triage-automation > span { display: grid; gap: 4px; font-size: 11px; }
+.triage-automation small { color: #788995; font-size: 10px; line-height: 1.5; font-weight: 400; }
+@media (max-width: 760px) { .triage-routing-field { grid-template-columns: 1fr; gap: 6px; } }
+
+.triage-system-option { padding: 4px 0 8px; border-bottom: 1px solid #edf1f2; }
+.triage-option-mapping { display: flex; align-items: center; gap: 8px; margin: 4px 0 6px 135px; }
+.triage-option-mapping span { color: #657b89; font-size: 10px; }
+.triage-option-mapping select { padding: 7px; border: 1px solid #dce5e8; border-radius: 5px; color: #355168; background: white; font: 11px 'DM Sans'; }
+.triage-option-footer { display: flex; align-items: center; justify-content: space-between; margin: 10px 0 4px 135px; color: #657b89; font-size: 11px; }
+@media (max-width: 700px) { .triage-option-mapping, .triage-option-footer { margin-left: 0; flex-wrap: wrap; } }
+
+.triage-custom-option { margin: 9px 0; padding: 12px; border: 1px solid #dfe8eb; border-radius: 8px; background: #fbfcfc; }
+.triage-custom-option-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 9px; color: #395a6b; font-size: 11px; }
+.triage-custom-note { align-self: center; color: #587181; font-size: 11px; line-height: 1.5; }
+.triage-custom-option-fields { display: grid; grid-template-columns: minmax(0, 1fr); gap: 12px; }
+.triage-custom-option-fields label, .triage-score-option label { display: grid; gap: 6px; color: #657b89; font-size: 11px; font-weight: 600; }
+.triage-custom-option-fields label span, .triage-score-option label span { display: block; }
+.triage-custom-option-fields input, .triage-custom-option-fields select, .triage-score-option input { width: 100%; min-width: 0; padding: 9px; border: 1px solid #dce5e8; border-radius: 5px; color: #355168; background: #fff; font: 11px 'DM Sans'; }
+.triage-score-option { display: flex; gap: 10px; align-items: end; margin: 7px 0; padding: 9px; border: 1px solid #e4ebed; border-radius: 7px; background: #fbfcfc; }
+.triage-score-option label { flex: 1; }
+.button-quiet { border: 0; padding: 5px 8px; color: #647d89; background: transparent; font: 11px 'DM Sans'; cursor: pointer; }
+.button-quiet:hover { color: #a74242; background: #fff1f1; }
+@media (max-width: 760px) { .triage-score-option { align-items: stretch; flex-direction: column; } }
+
+.triage-profile { margin: 18px 0; padding: 16px; border: 1px solid #dfe8eb; border-radius: 8px; background: #fbfcfd; }
+.triage-profile h3 { margin: 0 0 5px; color: #395a6b; font-size: 13px; }
+.triage-profile > p { margin: 0 0 14px; color: #7b8c96; font-size: 11px; line-height: 1.5; }
+.triage-profile-grid { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.triage-profile-grid label { display: grid; gap: 6px; color: #637988; font-size: 10px; font-weight: 600; }
+.triage-profile-grid .wide { grid-column: 1 / -1; }
+.triage-profile-grid input, .triage-profile-grid textarea { width: 100%; min-width: 0; padding: 9px; border: 1px solid #dce5e8; border-radius: 5px; background: white; color: #355168; font: 11px/1.5 'DM Sans'; }
+.triage-prompt-field textarea:disabled { background: #f3f6f7; color: #748791; }
+@media (max-width: 760px) { .triage-profile-grid { grid-template-columns: 1fr; } .triage-profile-grid .wide { grid-column: auto; } }
+
+.triage-calibration summary { color: #395a6b; cursor: pointer; font-size: 12px; font-weight: 700; }
+.triage-calibration[open] summary { margin-bottom: 8px; }

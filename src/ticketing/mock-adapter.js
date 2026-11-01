@@ -1,5 +1,5 @@
 import { randomUUID } from 'node:crypto';
-import { query, sqlValue } from '../postgres.js';
+import { query, sqlValue } from '../database.js';
 import { articlesFor, createIncidentFor, listTickets } from '../repository.js';
 
 const adapterInfo = Object.freeze({
@@ -26,7 +26,7 @@ export function createMockTicketingAdapter() {
 
     async createTicket({ request, decision, priority, queue }) {
       const id = `TCK-${randomUUID().slice(0, 8).toUpperCase()}`;
-      const protocol = `JUD-${query("SELECT lpad(nextval('ticket_protocol_seq')::text,6,'0')")}`;
+      const protocol = `JUD-${query("INSERT INTO ticket_protocol_seq() VALUES(); SELECT LPAD(LAST_INSERT_ID(),6,'0')")}`;
 
       query(
         `INSERT INTO tickets(id,protocol,request_id,description,category,system,impact,urgency,priority,assigned_queue,confidence,synthetic) VALUES(${sqlValue(id)},${sqlValue(protocol)},${sqlValue(request.id)},${sqlValue(request.description)},${sqlValue(decision.category)},${sqlValue(decision.system)},${sqlValue(decision.impact)},${sqlValue(decision.urgency)},${sqlValue(priority)},${sqlValue(queue)},${Number(request.confidence)},false)`,

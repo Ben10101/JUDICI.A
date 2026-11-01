@@ -3,6 +3,7 @@ import {
   evaluationCases,
   getFeedbackEvaluationReport,
   getTriageQuestionSettings,
+  getTriageConfiguration,
   saveFeedbackEvaluationReport,
 } from './repository.js';
 import { calibrateDecision } from './triage.js';
@@ -56,12 +57,13 @@ export async function evaluateSavedFeedbackCases() {
   if (pending.length > 100)
     throw new Error('A avaliação pela tela aceita até 100 casos por execução.');
 
-  const questions = getTriageQuestionSettings();
+  const triageConfig = getTriageConfiguration();
+  const questions = triageConfig.questions;
   for (const item of pending) {
     const caseNumber = cases.findIndex((candidate) => String(candidate.id) === String(item.id)) + 1;
     try {
-      const evaluated = await classifyWithProvider(item.text, questions);
-      const decision = calibrateDecision(item.text, evaluated.decision);
+      const evaluated = await classifyWithProvider(item.text, questions, triageConfig);
+      const decision = calibrateDecision(item.text, evaluated.decision, triageConfig.calibrationRules, Object.keys(questions.category.criteria), Object.keys(questions.system.criteria));
       const actual = actualLabels(decision);
       const expected = item.expected || {};
       const compared = evaluatedFields.filter((field) => Object.hasOwn(expected, field));

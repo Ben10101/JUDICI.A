@@ -1,43 +1,12 @@
 import fs from 'node:fs';
 import path from 'node:path';
-import { projectRoot } from './config.js';
-import { query, queryJson, sqlValue } from './postgres.js';
-import { decisionQuestions } from './triage.js';
-
-const schema = `
-CREATE TABLE IF NOT EXISTS app_users (id uuid PRIMARY KEY,email text NOT NULL UNIQUE,display_name text NOT NULL,role text NOT NULL CHECK(role IN ('solicitante','tic','gestor')),password_salt text NOT NULL,password_hash text NOT NULL,active boolean NOT NULL DEFAULT true,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS app_sessions (token_hash text PRIMARY KEY,user_id uuid NOT NULL REFERENCES app_users(id) ON DELETE CASCADE,csrf_hash text NOT NULL,expires_at timestamptz NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS app_sessions_user_expiry_idx ON app_sessions(user_id,expires_at);
-CREATE TABLE IF NOT EXISTS knowledge_articles (id text PRIMARY KEY,title text NOT NULL,category text NOT NULL,system text NOT NULL,problem text NOT NULL,solution text NOT NULL,steps jsonb NOT NULL DEFAULT '[]',active boolean NOT NULL DEFAULT true,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS requests (id text PRIMARY KEY,description text NOT NULL,decision jsonb NOT NULL,priority text NOT NULL,queue text NOT NULL,confidence numeric NOT NULL,article_id text REFERENCES knowledge_articles(id),status text NOT NULL DEFAULT 'ANALYZED',provider text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS decisions (id bigserial PRIMARY KEY,request_id text NOT NULL REFERENCES requests(id) ON DELETE CASCADE,payload jsonb NOT NULL,provider text NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE SEQUENCE IF NOT EXISTS ticket_protocol_seq START 106;
-CREATE TABLE IF NOT EXISTS tickets (id text PRIMARY KEY,protocol text UNIQUE NOT NULL,request_id text NOT NULL REFERENCES requests(id),description text NOT NULL,category text NOT NULL,system text NOT NULL,impact text NOT NULL,urgency text NOT NULL,priority text NOT NULL,status text NOT NULL DEFAULT 'OPEN',assigned_queue text NOT NULL,confidence numeric NOT NULL,incident_code text,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS incidents (code text PRIMARY KEY,title text NOT NULL,system text NOT NULL,category text NOT NULL,severity text NOT NULL,status text NOT NULL DEFAULT 'INVESTIGATING',detected_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS incident_tickets (incident_code text NOT NULL REFERENCES incidents(code) ON DELETE CASCADE,ticket_id text NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,PRIMARY KEY(incident_code,ticket_id));
-CREATE TABLE IF NOT EXISTS service_events (id bigserial PRIMARY KEY,type text NOT NULL,request_id text NOT NULL REFERENCES requests(id),knowledge_article_id text,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS ticket_status_history (id bigserial PRIMARY KEY,ticket_id text NOT NULL REFERENCES tickets(id) ON DELETE CASCADE,previous_status text,status text NOT NULL,observed_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS request_feedback (request_id text PRIMARY KEY REFERENCES requests(id) ON DELETE CASCADE,rating smallint NOT NULL CHECK(rating BETWEEN 1 AND 5),comment text,created_at timestamptz NOT NULL DEFAULT now());
-CREATE INDEX IF NOT EXISTS tickets_system_created_idx ON tickets(system,created_at DESC);
-CREATE INDEX IF NOT EXISTS requests_created_idx ON requests(created_at DESC);
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS triage_status text NOT NULL DEFAULT 'READY';
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS locality text NOT NULL DEFAULT 'Não informada';
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS article_snapshot jsonb;
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS corrected_decision jsonb;
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS corrected_at timestamptz;
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS correction_reason text;
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS synthetic boolean NOT NULL DEFAULT false;
-ALTER TABLE requests ADD COLUMN IF NOT EXISTS created_by uuid REFERENCES app_users(id);
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS synthetic boolean NOT NULL DEFAULT false;
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS first_assigned_at timestamptz;
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS first_resolved_at timestamptz;
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS status_synced_at timestamptz;
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS glpi_category_id integer;
-ALTER TABLE tickets ADD COLUMN IF NOT EXISTS queue_routing text NOT NULL DEFAULT 'SUGGESTED_ONLY';
-CREATE TABLE IF NOT EXISTS evaluation_cases (id bigserial PRIMARY KEY,source_request_id text NOT NULL UNIQUE REFERENCES requests(id) ON DELETE CASCADE,text text NOT NULL,expected jsonb NOT NULL,created_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS app_settings (key text PRIMARY KEY,value jsonb NOT NULL,updated_at timestamptz NOT NULL DEFAULT now());
-CREATE TABLE IF NOT EXISTS service_localities (id bigserial PRIMARY KEY,name text NOT NULL,active boolean NOT NULL DEFAULT true,created_at timestamptz NOT NULL DEFAULT now(),updated_at timestamptz NOT NULL DEFAULT now());
-CREATE UNIQUE INDEX IF NOT EXISTS service_localities_name_lower_uidx ON service_localities(lower(name));`;
+import { projectRoot, ticketingProvider, glpiConfig } from './config.js';
+import { currentTenantId, setTenantContext, DEFAULT_TENANT_ID } from './tenant-context.js';
+import { randomUUID } from 'node:crypto';
+import { encryptTenantSecret, decryptTenantSecret } from './tenant-secrets.js';
+import { query, queryJson, queryRegistry, queryRegistryJson, sqlValue, createTenantDatabase, createRegistryDatabase } from './database.js';
+import { applyRegistryMigrations, applyTenantMigrations } from './prisma-migrations.js';
+import { decisionQuestions, DEFAULT_LAYA_PAYLOAD_TEMPLATE, TRIAGE_THRESHOLDS, TRIAGE_ROUTING, TRIAGE_ROUTING_RULES, TRIAGE_CALIBRATION_RULES, TRIAGE_PRIORITY_MATRIX, CATEGORIES, SYSTEMS, LEVELS } from './triage.js';
 
 const seedArticles = [
   {
@@ -138,30 +107,142 @@ const seedArticles = [
     ],
   },
 ];
-export function init() {
-  query(schema);
+export function initializeTenantDatabase(tenantId) {
+  setTenantContext(tenantId);
+  createTenantDatabase(tenantId);
+  applyTenantMigrations(tenantId);
   for (const article of seedArticles)
-    query(
-      `INSERT INTO knowledge_articles(id,title,category,system,problem,solution,steps) VALUES(${sqlValue(article.id)},${sqlValue(article.title)},${sqlValue(article.category)},${sqlValue(article.system)},${sqlValue(article.problem)},${sqlValue(article.solution)},${sqlValue(JSON.stringify(article.steps))}::jsonb) ON CONFLICT(id) DO NOTHING`,
-    );
-  seedTickets();
-  query(
-    "UPDATE requests SET synthetic=true WHERE id LIKE 'REQ-DEMO-%'; UPDATE tickets SET synthetic=true WHERE id LIKE 'TCK-DEMO-%';",
-  );
-  query(
-    "UPDATE requests SET priority='MEDIUM',decision=jsonb_set(jsonb_set(jsonb_set(decision,'{impact}','\"MEDIUM\"'::jsonb),'{urgency}','\"MEDIUM\"'::jsonb),'{possibleIncident}','false'::jsonb) WHERE id='REQ-DEMO-02'; UPDATE tickets SET impact='MEDIUM',urgency='MEDIUM',priority='MEDIUM' WHERE id='TCK-DEMO-02';",
-  );
-  query(
-    "UPDATE incidents SET status='DISMISSED' WHERE status='INVESTIGATING' AND code IN (SELECT DISTINCT it.incident_code FROM incident_tickets it JOIN tickets t ON t.id=it.ticket_id WHERE t.synthetic);",
-  );
+    query(`INSERT IGNORE INTO knowledge_articles(id,title,category,system,problem,solution,steps) VALUES(${sqlValue(article.id)},${sqlValue(article.title)},${sqlValue(article.category)},${sqlValue(article.system)},${sqlValue(article.problem)},${sqlValue(article.solution)},${sqlValue(JSON.stringify(article.steps))})`);
 }
 
+export function init() {
+  createRegistryDatabase();
+  applyRegistryMigrations();
+  queryRegistry(`INSERT IGNORE INTO tenants(id,slug,name) VALUES('${DEFAULT_TENANT_ID}','default','Organizacao padrao')`);
+  const tenantIds = queryRegistry('SELECT id FROM tenants ORDER BY slug').split(/\r?\n/).filter(Boolean);
+  for (const tenantId of new Set([...tenantIds, DEFAULT_TENANT_ID])) initializeTenantDatabase(tenantId);
+  setTenantContext(DEFAULT_TENANT_ID);
+  seedTickets();
+  query("UPDATE requests SET synthetic=true WHERE id LIKE 'REQ-DEMO-%'; UPDATE tickets SET synthetic=true WHERE id LIKE 'TCK-DEMO-%';");
+  query("UPDATE tickets SET impact='MEDIUM',urgency='MEDIUM',priority='MEDIUM' WHERE id='TCK-DEMO-02';");
+  query("UPDATE incidents SET status='DISMISSED' WHERE status='INVESTIGATING' AND code IN (SELECT DISTINCT it.incident_code FROM incident_tickets it JOIN tickets t ON t.id=it.ticket_id WHERE t.synthetic);");
+}
+
+const EMPTY_TICKETING_SETTINGS = Object.freeze({
+  provider: 'mock', apiBaseUrl: '', clientId: '', clientSecret: '', username: '', password: '',
+  scope: 'api', apiVersion: 'v2', knowledgeResource: 'Knowledgebase/Article', queueCategoryIds: {},
+});
+
+export function getTenantTicketingConfiguration() {
+  const tenantId = currentTenantId() || DEFAULT_TENANT_ID;
+  const saved = queryJson(`SELECT value FROM app_settings WHERE key='ticketing_integration' LIMIT 1`, null);
+  if (saved) return { ...saved, clientSecret: decryptTenantSecret(saved.clientSecret), password: decryptTenantSecret(saved.password) };
+  if (tenantId === DEFAULT_TENANT_ID) return {
+    provider: ticketingProvider, apiBaseUrl: glpiConfig.apiBaseUrl, clientId: glpiConfig.clientId,
+    clientSecret: glpiConfig.clientSecret, username: glpiConfig.username, password: glpiConfig.password,
+    scope: glpiConfig.scope, apiVersion: glpiConfig.apiVersion,
+    knowledgeResource: glpiConfig.knowledgeResource, queueCategoryIds: glpiConfig.queueCategoryIds,
+  };
+  return { ...EMPTY_TICKETING_SETTINGS, queueCategoryIds: {} };
+}
+
+export function getTenantTicketingSettings() {
+  const config = getTenantTicketingConfiguration();
+  return {
+    provider: config.provider, apiBaseUrl: config.apiBaseUrl, clientId: config.clientId,
+    username: config.username, scope: config.scope, apiVersion: config.apiVersion,
+    knowledgeResource: config.knowledgeResource, queueCategoryIds: config.queueCategoryIds,
+    hasClientSecret: Boolean(config.clientSecret), hasPassword: Boolean(config.password),
+  };
+}
+
+export function saveTenantTicketingSettings(input = {}) {
+  const current = getTenantTicketingConfiguration();
+  const values = {
+    provider: String(input.provider || 'mock').trim().toLowerCase(),
+    apiBaseUrl: String(input.apiBaseUrl || '').trim().replace(/\/+$/, ''),
+    clientId: String(input.clientId || '').trim(),
+    clientSecret: String(input.clientSecret || '').trim() || (String(input.provider || 'mock').trim().toLowerCase() === current.provider ? current.clientSecret : ''),
+    username: String(input.username || '').trim(), password: String(input.password || '').trim() || (String(input.provider || 'mock').trim().toLowerCase() === current.provider ? current.password : ''),
+    scope: String(input.scope || 'api').trim(), apiVersion: String(input.apiVersion || 'v2').trim(),
+    knowledgeResource: String(input.knowledgeResource || 'Knowledgebase/Article').trim(),
+    queueCategoryIds: Object.fromEntries(Object.entries(input.queueCategoryIds || {}).map(([queue, id]) => {
+      const value = String(id || '').trim();
+      if (!/^[A-Z][A-Z0-9_-]{1,63}$/.test(queue) || (value && !/^\d+$/.test(value))) throw new Error('Revise os c\u00f3digos das filas e os IDs num\u00e9ricos do GLPI.');
+      return [queue, value];
+    }).filter(([, id]) => id)),
+  };
+  if (!['mock','glpi'].includes(values.provider)) throw new Error('Provedor de chamados inv\u00e1lido.');
+  if (values.apiBaseUrl && !/^https?:\/\//i.test(values.apiBaseUrl)) throw new Error('A URL do GLPI deve come\u00e7ar com http:// ou https://.');
+  if (values.provider === 'glpi') {
+    if (!values.apiBaseUrl || !values.clientId || !values.clientSecret || !values.username || !values.password) throw new Error('Preencha URL, ID do cliente, segredos e usu\u00e1rio do GLPI.');
+    encryptTenantSecret(values.clientSecret);
+    encryptTenantSecret(values.password);
+  }
+  const stored = { ...values, clientSecret: encryptTenantSecret(values.clientSecret), password: encryptTenantSecret(values.password) };
+  query(`INSERT INTO app_settings(tenant_id,key,value) VALUES(COALESCE(NULLIF(current_setting('app.tenant_id',true),'')::uuid,'${DEFAULT_TENANT_ID}'::uuid),'ticketing_integration',${sqlValue(JSON.stringify(stored))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`);
+  return getTenantTicketingSettings();
+}
+
+export function tenantBySlug(slug) {
+  const normalized = String(slug || '').trim().toLowerCase();
+  if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(normalized)) return null;
+  return queryRegistryJson(`SELECT JSON_OBJECT('id',id,'slug',slug,'name',name) FROM tenants WHERE slug=${sqlValue(normalized)} AND active=true LIMIT 1`, null);
+}
+
+export function createTenant(input = {}) {
+  const name = String(input.name || '').trim();
+  const slug = String(input.slug || '').trim().toLowerCase();
+  if (name.length < 2 || name.length > 120) throw new Error('O nome da organizacao deve ter de 2 a 120 caracteres.');
+  if (!/^[a-z0-9][a-z0-9-]{1,61}[a-z0-9]$/.test(slug)) throw new Error('O identificador deve ter de 3 a 63 caracteres, com letras, numeros e hifens.');
+  const id = randomUUID();
+  try {
+    queryRegistry(`INSERT INTO tenants(id,slug,name) VALUES(${sqlValue(id)},${sqlValue(slug)},${sqlValue(name)})`);
+    initializeTenantDatabase(id);
+    return { id, slug, name };
+  } catch (error) {
+    if (/unique|duplicate/i.test(error.message)) throw new Error('Ja existe uma organizacao com esse identificador.');
+    throw error;
+  }
+}
 export function getTriageQuestionSettings() {
   const saved = queryJson(
     `SELECT value FROM app_settings WHERE key='triage_questions' LIMIT 1`,
     null,
   );
   return saved || decisionQuestions;
+}
+
+const DEFAULT_SUPPORT_PROFILE = Object.freeze({
+  organizationName: 'Tribunal',
+  serviceName: 'Suporte de TIC',
+  requestLabel: 'solicita\\u00e7\\u00e3o de suporte',
+  scopeDescription: 'problemas de tecnologia da informa\\u00e7\\u00e3o, incluindo sistemas, equipamentos, redes e aplicativos utilizados no Tribunal.',
+});
+
+export function normalizeSupportProfile(input = {}) {
+  const profile = {};
+  for (const [key, label, max] of [
+    ['organizationName', 'O nome da organiza\\u00e7\\u00e3o', 100],
+    ['serviceName', 'O nome do servi\\u00e7o de suporte', 100],
+    ['requestLabel', 'O nome da solicita\\u00e7\\u00e3o', 60],
+    ['scopeDescription', 'A descri\\u00e7\\u00e3o do escopo do suporte', 600],
+  ]) {
+    const value = String(input[key] ?? DEFAULT_SUPPORT_PROFILE[key]).trim();
+    if (value.length < 2 || value.length > max) throw new Error(`${label} deve ter entre 2 e ${max} caracteres.`);
+    profile[key] = value;
+  }
+  return profile;
+}
+
+function questionsForProfile(questions, profile) {
+  return {
+    ...questions,
+    is_it_support: {
+      ...questions.is_it_support,
+      instructions: `A mensagem descreve a demanda "${profile.requestLabel}" atendida pelo servi\\u00e7o ${profile.serviceName} da organiza\\u00e7\\u00e3o ${profile.organizationName}? Escopo: ${profile.scopeDescription} Responda n\\u00e3o para assuntos que n\\u00e3o pertencem a esse servi\\u00e7o.`,
+    },
+  };
 }
 
 export function normalizeTriageQuestionSettings(input = {}) {
@@ -172,15 +253,26 @@ export function normalizeTriageQuestionSettings(input = {}) {
       throw new Error(`A instrução de ${key} deve ter entre 12 e 800 caracteres.`);
     const question = { ...original, instructions };
     if (original.criteria && !Array.isArray(original.criteria)) {
+      const sourceCriteria = input[key]?.criteria || original.criteria;
+      if (!sourceCriteria || typeof sourceCriteria !== 'object' || Array.isArray(sourceCriteria)) throw new Error(`As opções de ${key} devem ser um objeto.`);
+      const optionKeys = Object.keys(sourceCriteria);
+      const maxOptions = ['system','category'].includes(key) ? 100 : Object.keys(original.criteria).length;
+      if (optionKeys.length > maxOptions) throw new Error(`A pergunta ${key} aceita até ${maxOptions} opções no Laya local.`);
+      for (const option of Object.keys(original.criteria)) if (!Object.hasOwn(sourceCriteria, option)) throw new Error(`A opção padrão ${option} não pode ser removida de ${key}.`);
       question.criteria = {};
-      for (const option of Object.keys(original.criteria)) {
-        const text = String(input[key]?.criteria?.[option] ?? '').trim();
+      for (const option of optionKeys) {
+        if (!/^[A-Z][A-Z0-9_]{1,39}$/.test(option)) throw new Error(`O código da opção ${option} deve usar letras maiúsculas, números ou sublinhado.`);
+        const text = String(sourceCriteria[option] ?? '').trim();
         if (text.length < 2 || text.length > 240) throw new Error(`Invalid criterion ${option} for ${key}.`);
         question.criteria[option] = text;
       }
     } else if (Array.isArray(original.criteria)) {
-      question.criteria = original.criteria.map((_, index) => {
-        const text = String(input[key]?.criteria?.[index] ?? '').trim();
+      const sourceCriteria = Array.isArray(input[key]?.criteria) ? input[key].criteria : original.criteria;
+      const maxLevels = 32;
+      if (sourceCriteria.length > maxLevels) throw new Error(`A escala ${key} aceita até ${maxLevels} níveis no Laya local.`);
+      if (sourceCriteria.length < original.criteria.length) throw new Error(`A escala ${key} precisa manter pelo menos os quatro níveis padrão.`);
+      question.criteria = sourceCriteria.map((_, index) => {
+        const text = String(sourceCriteria[index] ?? '').trim();
         if (text.length < 2 || text.length > 240) throw new Error(`Invalid level ${index + 1} for ${key}.`);
         return text;
       });
@@ -190,12 +282,207 @@ export function normalizeTriageQuestionSettings(input = {}) {
   return updated;
 }
 
+export function normalizeCategoryOptionMappings(input = {}, criteria = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Os vínculos das categorias devem ser um objeto.');
+  const mappings = {};
+  for (const code of Object.keys(criteria)) {
+    if (CATEGORIES.includes(code)) continue;
+    const target = String(input[code] || code).toUpperCase();
+    if (!Object.hasOwn(criteria, target)) throw new Error(`A opção personalizada ${code} deve ser associada a uma categoria configurada.`);
+    mappings[code] = target;
+  }
+  return mappings;
+}
+
+export function normalizeSystemOptionMappings(input = {}, criteria = {}) {
+  if (!input || typeof input !== 'object' || Array.isArray(input)) throw new Error('Os vínculos das opções de sistema devem ser um objeto.');
+  const mappings = {};
+  for (const code of Object.keys(criteria)) {
+    if (SYSTEMS.includes(code)) continue;
+    const requestedTarget = String(input[code] || 'OTHER').toUpperCase();
+    mappings[code] = SYSTEMS.includes(requestedTarget) ? requestedTarget : 'OTHER';
+  }
+  return mappings;
+}
+
 export function saveTriageQuestionSettings(input = {}) {
   const updated = normalizeTriageQuestionSettings(input);
   query(
-    `INSERT INTO app_settings(key,value) VALUES('triage_questions',${sqlValue(JSON.stringify(updated))}::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+    `INSERT INTO app_settings(key,value) VALUES('triage_questions',${sqlValue(JSON.stringify(updated))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
   );
   return updated;
+}
+export function getTriageThresholdSettings() {
+  const saved = queryJson(`SELECT value FROM app_settings WHERE key='triage_thresholds' LIMIT 1`, null);
+  return normalizeTriageThresholdSettings(saved || TRIAGE_THRESHOLDS);
+}
+
+export function normalizeTriageThresholdSettings(input = {}) {
+  const normalized = {};
+  for (const key of Object.keys(TRIAGE_THRESHOLDS)) {
+    const value = Number(input[key] ?? TRIAGE_THRESHOLDS[key]);
+    if (!Number.isFinite(value) || value < 0 || value > 1)
+      throw new Error(`O limite ${key} deve estar entre 0% e 100%.`);
+    normalized[key] = Math.round(value * 100) / 100;
+  }
+  if (normalized.outOfScope >= normalized.inScope)
+    throw new Error('O limite de fora do escopo deve ser menor que o limite de dentro do escopo.');
+  return normalized;
+}
+
+export function getTriageConfiguration() {
+  const setting = (key, fallback) => queryJson(`SELECT value FROM app_settings WHERE key=${sqlValue(key)} LIMIT 1`, fallback);
+  const tenantDefault = queryRegistryJson(`SELECT JSON_OBJECT('organizationName',name) FROM tenants WHERE id=${sqlValue(currentTenantId() || DEFAULT_TENANT_ID)} LIMIT 1`, DEFAULT_SUPPORT_PROFILE);
+  const tenantId = currentTenantId() || DEFAULT_TENANT_ID;
+  const tenantProfileDefaults = tenantId === DEFAULT_TENANT_ID ? { ...DEFAULT_SUPPORT_PROFILE, ...tenantDefault } : { ...DEFAULT_SUPPORT_PROFILE, ...tenantDefault, serviceName: 'Suporte', scopeDescription: 'Demandas atendidas pelo servi\u00e7o de suporte definido para esta organiza\u00e7\u00e3o.' };
+  const supportProfile = normalizeSupportProfile(setting('triage_support_profile', tenantProfileDefaults));
+  const questions = questionsForProfile(getTriageQuestionSettings(), supportProfile);
+  return {
+    supportProfile,
+    questions,
+    systemOptionMappings: normalizeSystemOptionMappings(setting('triage_system_option_mappings', {}), questions.system?.criteria || {}),
+    categoryOptionMappings: normalizeCategoryOptionMappings(setting('triage_category_option_mappings', {}), questions.category?.criteria || {}),
+    thresholds: getTriageThresholdSettings(),
+    routing: normalizeTriageRouting(setting('triage_routing', TRIAGE_ROUTING)),
+    routingRules: normalizeTriageRoutingRules(setting('triage_routing_rules', TRIAGE_ROUTING_RULES), Object.keys(questions.category?.criteria || {}), Object.keys(questions.system?.criteria || {})),
+    priorityMatrix: normalizeTriagePriorityMatrix(setting('triage_priority_matrix', TRIAGE_PRIORITY_MATRIX)),
+    automationApproved: Boolean(setting('triage_automation', process.env.TRIAGE_AUTOMATION_APPROVED === 'true')),
+    calibrationRules: normalizeTriageCalibrationRules(setting('triage_calibration', TRIAGE_CALIBRATION_RULES), Object.keys(questions.category?.criteria || {}), Object.keys(questions.system?.criteria || {})),
+    payloadTemplate: normalizeTriagePayloadTemplate(setting('triage_payload', DEFAULT_LAYA_PAYLOAD_TEMPLATE)),
+  };
+}
+
+export function normalizeTriagePayloadTemplate(input = DEFAULT_LAYA_PAYLOAD_TEMPLATE) {
+  if (!input || typeof input !== 'object' || Array.isArray(input) || JSON.stringify(input).length > 20000)
+    throw new Error('O payload do Laya deve ser um objeto JSON com até 20 KB.');
+  if (typeof input.model !== 'string' || !input.model.trim() || input.model.length > 120)
+    throw new Error('Informe o modelo do Laya ou use {{model}}.');
+  if (!input.state || typeof input.state !== 'object' || Array.isArray(input.state) || input.state.support_request !== '{{description}}')
+    throw new Error('O payload precisa conter state.support_request com o marcador {{description}}.');
+  if (input.questions !== '{{questions}}')
+    throw new Error('O payload precisa conter questions com o marcador {{questions}} para enviar os critérios configurados.');
+  const allowed = new Set(['description','model','questions']);
+  const inspect = (value) => {
+    if (Array.isArray(value)) return value.forEach(inspect);
+    if (value && typeof value === 'object') return Object.values(value).forEach(inspect);
+    if (typeof value === 'string') for (const match of value.matchAll(/\{\{([^{}]+)\}\}/g)) {
+      if (!allowed.has(match[1])) throw new Error('Marcador desconhecido no payload: {{' + match[1] + '}}.');
+    }
+  };
+  inspect(input);
+  return JSON.parse(JSON.stringify(input));
+}
+
+export function normalizeTriageRouting(input = {}) {
+  const routing = {};
+  for (const key of Object.keys(TRIAGE_ROUTING)) {
+    const value = String(input[key] ?? TRIAGE_ROUTING[key]).trim().toUpperCase();
+    if (!/^[A-Z][A-Z0-9_-]{1,63}$/.test(value)) throw new Error(`A fila de destino para ${key} deve usar letras, números, hífens ou sublinhados.`);
+    routing[key] = value;
+  }
+  return routing;
+}
+
+export function normalizeTriageRoutingRules(input = [], categories = CATEGORIES, systems = SYSTEMS) {
+  if (!Array.isArray(input) || input.length > 80) throw new Error('Configure até 80 regras de roteamento.');
+  return input.map((rule) => {
+    if (!rule || !Array.isArray(rule.when) || !rule.when.length || rule.when.length > 40) throw new Error('Cada regra de roteamento precisa conter de 1 a 40 condições.');
+    const when = rule.when.map(({ field, value }) => {
+      const normalizedField = String(field || '').toLowerCase(); const normalizedValue = String(value || '').toUpperCase();
+      if (normalizedField === 'category' && categories.includes(normalizedValue)) return { field: normalizedField, value: normalizedValue };
+      if (normalizedField === 'system' && systems.includes(normalizedValue)) return { field: normalizedField, value: normalizedValue };
+      throw new Error('Condição inválida na regra de roteamento. Use categoria ou sistema existentes.');
+    });
+    const target = String(rule.target || '').toLowerCase();
+    if (!Object.hasOwn(TRIAGE_ROUTING, target)) throw new Error('Destino inválido na regra de roteamento.');
+    return { when, target };
+  });
+}
+
+export function normalizeTriagePriorityMatrix(input = {}) {
+  const matrix = {};
+  for (const impact of LEVELS) {
+    matrix[impact] = {};
+    for (const urgency of LEVELS) {
+      const value = String(input?.[impact]?.[urgency] ?? TRIAGE_PRIORITY_MATRIX[impact][urgency]).toUpperCase();
+      if (!LEVELS.includes(value)) throw new Error(`A prioridade para impacto ${impact} e urgência ${urgency} deve ser LOW, MEDIUM, HIGH ou CRITICAL.`);
+      matrix[impact][urgency] = value;
+    }
+  }
+  return matrix;
+}
+
+export function normalizeTriageCalibrationRules(input = {}, categories = CATEGORIES, systems = SYSTEMS) {
+  const defaults = TRIAGE_CALIBRATION_RULES;
+  const list = (key) => {
+    const value = input[key] ?? defaults[key];
+    if (!Array.isArray(value) || value.length > 80) throw new Error(`A lista ${key} deve conter no máximo 80 termos.`);
+    return value.map((item) => {
+      const term = String(item).trim();
+      if (!term || term.length > 100) throw new Error(`Cada termo de ${key} deve ter entre 1 e 100 caracteres.`);
+      return term;
+    });
+  };
+  const rules = { ...defaults };
+  for (const key of ['technicalTerms','outOfScopeTerms','collectiveTerms','outageTerms','individualOnlyTerms','vagueTerms','technicalDetailTerms','fallbackUrgencyTerms']) rules[key] = list(key);
+  if (!Array.isArray(input.categoryRules ?? defaults.categoryRules) || (input.categoryRules ?? defaults.categoryRules).length > 40) throw new Error('Configure até 40 regras de categoria.');
+  rules.categoryRules = (input.categoryRules ?? defaults.categoryRules).map((rule) => {
+    if (!rule || !Array.isArray(rule.groups) || rule.groups.length < 1 || rule.groups.length > 5) throw new Error('Cada regra de categoria precisa ter de 1 a 5 grupos de termos.');
+    const groups = rule.groups.map((group) => {
+      if (!Array.isArray(group) || group.length < 1 || group.length > 30) throw new Error('Cada grupo deve conter de 1 a 30 termos.');
+      return group.map((term) => { const text = String(term).trim(); if (!text || text.length > 100) throw new Error('Cada termo deve ter entre 1 e 100 caracteres.'); return text; });
+    });
+    const category = String(rule.category || '').toUpperCase();
+    if (!categories.includes(category)) throw new Error(`Categoria inválida na regra: ${category}.`);
+    const system = rule.system == null ? null : String(rule.system).toUpperCase();
+    if (system && !systems.includes(system)) throw new Error(`Sistema inválido na regra: ${system}.`);
+    if (!system && rule.systemFromText !== true) throw new Error('Cada regra de categoria precisa definir um sistema ou usar systemFromText.');
+    return { groups, category, system, systemFromText: rule.systemFromText === true };
+  });
+  const fallback = input.fallbackRules ?? defaults.fallbackRules;
+  if (!Array.isArray(fallback) || fallback.length > 40) throw new Error('Configure até 40 regras de classificação local.');
+  rules.fallbackRules = fallback.map((rule) => {
+    const terms = Array.isArray(rule.terms) ? rule.terms.map((x) => String(x).trim()) : [];
+    const category = String(rule.category || '').toUpperCase(); const system = String(rule.system || '').toUpperCase(); const confidence = Number(rule.confidence);
+    if (!terms.length || terms.length > 40 || terms.some((x) => !x || x.length > 100)) throw new Error('Cada regra local precisa ter de 1 a 40 termos válidos.');
+    if (!categories.includes(category) || !systems.includes(system) || !Number.isFinite(confidence) || confidence < 0 || confidence > 1) throw new Error('Revise categoria, sistema e confiança das regras locais.');
+    return { terms, category, system, confidence };
+  });
+  rules.systemTerms = {};
+  const systemTerms = input.systemTerms ?? defaults.systemTerms;
+  if (!systemTerms || typeof systemTerms !== 'object' || Array.isArray(systemTerms)) throw new Error('Configure os termos de identificação dos sistemas.');
+  for (const [system, terms] of Object.entries(systemTerms)) { if (!systems.includes(system)) throw new Error(`Sistema inválido nos termos: ${system}.`); rules.systemTerms[system] = Array.isArray(terms) ? terms.map((term) => String(term).trim()).filter(Boolean) : []; if (!rules.systemTerms[system].length || rules.systemTerms[system].some((term) => term.length > 100)) throw new Error(`Informe termos válidos para o sistema ${system}.`); }
+  rules.outOfScopeCategory = String(input.outOfScopeCategory ?? defaults.outOfScopeCategory).toUpperCase();
+  if (!categories.includes(rules.outOfScopeCategory)) throw new Error('A categoria fora do escopo precisa ser válida.');
+  rules.fallbackUnknownSystem = String(input.fallbackUnknownSystem ?? defaults.fallbackUnknownSystem).toUpperCase();
+  if (!systems.includes(rules.fallbackUnknownSystem)) throw new Error('O sistema padrão precisa ser válido.');
+  rules.impactOnIncident = String(input.impactOnIncident ?? defaults.impactOnIncident).toUpperCase();
+  if (!['LOW','MEDIUM','HIGH','CRITICAL'].includes(rules.impactOnIncident)) throw new Error('O impacto para incidentes deve ser LOW, MEDIUM, HIGH ou CRITICAL.');
+  for (const key of ['supportScopeProbability','outOfScopeProbability','fallbackMatchedScopeProbability','fallbackUnmatchedScopeProbability','fallbackConfidence','yesNoThreshold','incidentConfidenceBoost','outageConfidenceBoost','collectiveConfidenceIncrease','collectiveConfidenceMaximum']) { const value = Number(input[key] ?? defaults[key]); if (!Number.isFinite(value) || value < 0 || value > 1) throw new Error(`${key} deve estar entre 0% e 100%.`); rules[key] = value; }
+  rules.confidenceAggregation = String(input.confidenceAggregation ?? defaults.confidenceAggregation).toLowerCase();
+  if (!['minimum','average'].includes(rules.confidenceAggregation)) throw new Error('Agregação de confiança deve ser minimum ou average.');
+  for (const key of ['urgencyOnIncident','defaultScoreLevel','fallbackImpact','fallbackUrgency','fallbackMatchedUrgency']) { const value = String(input[key] ?? defaults[key]).toUpperCase(); if (!LEVELS.includes(value)) throw new Error(`${key} deve ser LOW, MEDIUM, HIGH ou CRITICAL.`); rules[key] = value; }
+  return rules;
+}
+
+export function saveTriageConfiguration(input = {}) {
+  const current = getTriageConfiguration();
+  const supportProfile = normalizeSupportProfile(input.supportProfile || current.supportProfile);
+  const questions = questionsForProfile(normalizeTriageQuestionSettings(input.questions || input), supportProfile);
+  const systemOptionMappings = normalizeSystemOptionMappings(input.systemOptionMappings || current.systemOptionMappings, questions.system.criteria);
+  const categoryOptionMappings = normalizeCategoryOptionMappings(input.categoryOptionMappings || current.categoryOptionMappings, questions.category.criteria);
+  const thresholds = normalizeTriageThresholdSettings(input.thresholds || current.thresholds);
+  const routing = normalizeTriageRouting(input.routing || current.routing);
+  const categories = Object.keys(questions.category.criteria);
+  const systems = Object.keys(questions.system.criteria);
+  const routingRules = normalizeTriageRoutingRules(input.routingRules || current.routingRules, categories, systems);
+  const priorityMatrix = normalizeTriagePriorityMatrix(input.priorityMatrix || current.priorityMatrix);
+  const automationApproved = input.automationApproved == null ? current.automationApproved : input.automationApproved === true;
+  if (input.automationApproved != null && typeof input.automationApproved !== 'boolean') throw new Error('A liberação de automação deve ser verdadeiro ou falso.');
+  const calibrationRules = normalizeTriageCalibrationRules(input.calibrationRules || current.calibrationRules, categories, systems);
+  const payloadTemplate = normalizeTriagePayloadTemplate(input.payloadTemplate || current.payloadTemplate);
+  query(`BEGIN; INSERT INTO app_settings(key,value) VALUES('triage_support_profile',${sqlValue(JSON.stringify(supportProfile))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_questions',${sqlValue(JSON.stringify(questions))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_system_option_mappings',${sqlValue(JSON.stringify(systemOptionMappings))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_category_option_mappings',${sqlValue(JSON.stringify(categoryOptionMappings))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_thresholds',${sqlValue(JSON.stringify(thresholds))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_routing',${sqlValue(JSON.stringify(routing))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_routing_rules',${sqlValue(JSON.stringify(routingRules))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_priority_matrix',${sqlValue(JSON.stringify(priorityMatrix))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_automation',${sqlValue(JSON.stringify(automationApproved))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_calibration',${sqlValue(JSON.stringify(calibrationRules))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); INSERT INTO app_settings(key,value) VALUES('triage_payload',${sqlValue(JSON.stringify(payloadTemplate))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now(); COMMIT;`);
+  return { supportProfile, questions, systemOptionMappings, categoryOptionMappings, thresholds, routing, routingRules, priorityMatrix, automationApproved, calibrationRules, payloadTemplate };
 }
 export function triageBenchmarkCases() {
   const cases = JSON.parse(fs.readFileSync(path.join(projectRoot, 'evaluation', 'cases.json'), 'utf8'));
@@ -294,18 +581,16 @@ function seedTickets() {
 }
 
 export function articlesFor(category, system) {
-  return queryJson(
-    `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT id,title,category,system,problem,solution,steps FROM knowledge_articles WHERE active AND (system=${sqlValue(system)} OR category=${sqlValue(category)}) ORDER BY CASE WHEN system=${sqlValue(system)} THEN 0 ELSE 1 END,id LIMIT 5) x`,
-  );
+  return queryJson(`SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',id,'title',title,'category',category,'system',system,'problem',problem,'solution',solution,'steps',JSON_EXTRACT(steps,'$')) ORDER BY CASE WHEN system=${sqlValue(system)} THEN 0 ELSE 1 END,id LIMIT 5),'[]') FROM knowledge_articles WHERE active AND (system=${sqlValue(system)} OR category=${sqlValue(category)})`);
 }
 export function listTickets(ownerId = null) {
-  const ownerFilter = ownerId ? `WHERE r.created_by=${sqlValue(ownerId)}::uuid` : '';
-  return queryJson(`SELECT coalesce(json_agg(x),'[]'::json) FROM (
-    SELECT t.id,t.protocol,t.request_id AS "requestId",t.description,t.category,t.system,t.impact,t.urgency,t.priority,t.status,t.assigned_queue AS queue,t.queue_routing AS "queueRouting",t.glpi_category_id AS "glpiCategoryId",t.confidence::float,t.incident_code AS "incidentId",t.created_at AS "createdAt",r.locality,
-      CASE WHEN t.id LIKE 'GLPI-%' THEN json_build_object('provider','glpi','mode','external','displayName','GLPI 11') ELSE json_build_object('provider','mock','mode','simulated','displayName','Conector simulado') END AS integration,
-      CASE WHEN r.corrected_decision IS NOT NULL THEN 'human_correction' ELSE r.provider END AS provider,coalesce(r.article_snapshot->>'id',r.article_id) AS "articleId",r.article_snapshot AS article,coalesce(r.corrected_decision,r.decision) AS decision,(r.corrected_decision IS NOT NULL) AS "humanCorrected",t.synthetic
-    FROM tickets t JOIN requests r ON r.id=t.request_id ${ownerFilter} ORDER BY t.created_at DESC) x`).map(
-    (t) => ({ ...t, confidence: Number(t.confidence) }),
+  const ownerFilter = ownerId ? `WHERE r.created_by=${sqlValue(ownerId)}` : '';
+  return queryJson(`SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT(
+    'id',t.id,'protocol',t.protocol,'requestId',t.request_id,'description',t.description,'category',t.category,'system',t.system,'impact',t.impact,'urgency',t.urgency,'priority',t.priority,'status',t.status,'queue',t.assigned_queue,'queueRouting',t.queue_routing,'glpiCategoryId',t.glpi_category_id,'confidence',t.confidence,'incidentId',t.incident_code,'createdAt',t.created_at,'locality',r.locality,
+    'integration',JSON_OBJECT('provider',CASE WHEN t.id LIKE 'GLPI-%' THEN 'glpi' ELSE 'mock' END,'mode',CASE WHEN t.id LIKE 'GLPI-%' THEN 'external' ELSE 'simulated' END,'displayName',CASE WHEN t.id LIKE 'GLPI-%' THEN 'GLPI 11' ELSE 'Conector simulado' END),
+    'provider',CASE WHEN r.corrected_decision IS NOT NULL THEN 'human_correction' ELSE r.provider END,'articleId',COALESCE(JSON_UNQUOTE(JSON_EXTRACT(r.article_snapshot,'$.id')),r.article_id),'article',JSON_EXTRACT(r.article_snapshot,'$'),'decision',JSON_EXTRACT(COALESCE(r.corrected_decision,r.decision),'$'),'humanCorrected',r.corrected_decision IS NOT NULL,'synthetic',t.synthetic
+  ) ORDER BY t.created_at DESC),'[]') FROM tickets t JOIN requests r ON r.id=t.request_id ${ownerFilter}`).map(
+    (ticket) => ({ ...ticket, confidence: Number(ticket.confidence) }),
   );
 }
 export function requestOwnedBy(requestId, userId) {
@@ -381,10 +666,10 @@ export function pilotMetrics() {
       'requests',(SELECT count(*) FROM requests_window),
       'tickets',(SELECT count(*) FROM tickets_window),
       'selfServiceResolved',(SELECT count(*) FROM service_events e JOIN requests_window r ON r.id=e.request_id WHERE e.type='SELF_SERVICE_RESOLVED'),
-      'avgMinutesToAssignment',(SELECT round(avg(extract(epoch from (first_assigned_at-created_at))/60)::numeric,1) FROM tickets_window WHERE first_assigned_at IS NOT NULL),
-      'avgMinutesToResolution',(SELECT round(avg(extract(epoch from (first_resolved_at-created_at))/60)::numeric,1) FROM tickets_window WHERE first_resolved_at IS NOT NULL),
-      'responseSla',(SELECT CASE WHEN count(*)=0 THEN NULL ELSE round(100.0*count(*) FILTER(WHERE first_assigned_at-created_at <= make_interval(mins => (CASE priority WHEN 'CRITICAL' THEN targets.response_critical WHEN 'HIGH' THEN targets.response_high WHEN 'MEDIUM' THEN targets.response_medium WHEN 'LOW' THEN targets.response_low END)::int))/count(*),1) END FROM tickets_window CROSS JOIN targets WHERE first_assigned_at IS NOT NULL AND (CASE priority WHEN 'CRITICAL' THEN targets.response_critical WHEN 'HIGH' THEN targets.response_high WHEN 'MEDIUM' THEN targets.response_medium WHEN 'LOW' THEN targets.response_low END) IS NOT NULL),
-      'resolutionSla',(SELECT CASE WHEN count(*)=0 THEN NULL ELSE round(100.0*count(*) FILTER(WHERE first_resolved_at-created_at <= make_interval(mins => (CASE priority WHEN 'CRITICAL' THEN targets.resolution_critical WHEN 'HIGH' THEN targets.resolution_high WHEN 'MEDIUM' THEN targets.resolution_medium WHEN 'LOW' THEN targets.resolution_low END)::int))/count(*),1) END FROM tickets_window CROSS JOIN targets WHERE first_resolved_at IS NOT NULL AND (CASE priority WHEN 'CRITICAL' THEN targets.resolution_critical WHEN 'HIGH' THEN targets.resolution_high WHEN 'MEDIUM' THEN targets.resolution_medium WHEN 'LOW' THEN targets.resolution_low END) IS NOT NULL),
+      'avgMinutesToAssignment',(SELECT round(avg(TIMESTAMPDIFF(MICROSECOND,created_at,first_assigned_at)/60000000)::numeric,1) FROM tickets_window WHERE first_assigned_at IS NOT NULL),
+      'avgMinutesToResolution',(SELECT round(avg(TIMESTAMPDIFF(MICROSECOND,created_at,first_resolved_at)/60000000)::numeric,1) FROM tickets_window WHERE first_resolved_at IS NOT NULL),
+      'responseSla',(SELECT CASE WHEN COUNT(*)=0 THEN NULL ELSE ROUND(100.0*SUM(CASE WHEN TIMESTAMPDIFF(SECOND,created_at,first_assigned_at) <= (CASE priority WHEN 'CRITICAL' THEN targets.response_critical WHEN 'HIGH' THEN targets.response_high WHEN 'MEDIUM' THEN targets.response_medium WHEN 'LOW' THEN targets.response_low END)*60 THEN 1 ELSE 0 END)/COUNT(*),1) END FROM tickets_window CROSS JOIN targets WHERE first_assigned_at IS NOT NULL AND (CASE priority WHEN 'CRITICAL' THEN targets.response_critical WHEN 'HIGH' THEN targets.response_high WHEN 'MEDIUM' THEN targets.response_medium WHEN 'LOW' THEN targets.response_low END) IS NOT NULL),
+      'resolutionSla',(SELECT CASE WHEN COUNT(*)=0 THEN NULL ELSE ROUND(100.0*SUM(CASE WHEN TIMESTAMPDIFF(SECOND,created_at,first_resolved_at) <= (CASE priority WHEN 'CRITICAL' THEN targets.resolution_critical WHEN 'HIGH' THEN targets.resolution_high WHEN 'MEDIUM' THEN targets.resolution_medium WHEN 'LOW' THEN targets.resolution_low END)*60 THEN 1 ELSE 0 END)/COUNT(*),1) END FROM tickets_window CROSS JOIN targets WHERE first_resolved_at IS NOT NULL AND (CASE priority WHEN 'CRITICAL' THEN targets.resolution_critical WHEN 'HIGH' THEN targets.resolution_high WHEN 'MEDIUM' THEN targets.resolution_medium WHEN 'LOW' THEN targets.resolution_low END) IS NOT NULL),
       'avgSatisfaction',(SELECT round(avg(f.rating)::numeric,2) FROM request_feedback f JOIN requests_window r ON r.id=f.request_id),
       'satisfactionResponses',(SELECT count(*) FROM request_feedback f JOIN requests_window r ON r.id=f.request_id)
     )`);
@@ -396,13 +681,13 @@ export function pilotMetrics() {
   const baseline = metricForWindow(settings.baselineStart, settings.baselineEnd);
   const pilot = metricForWindow(settings.pilotStart, settings.pilotEnd);
   const locality = settings.pilotStart && settings.pilotEnd
-    ? queryJson(`SELECT coalesce(json_agg(x),'[]'::json) FROM (
-      SELECT coalesce(r.locality,'NÃ£o informada') AS locality,count(*)::int AS tickets,
-      round(avg(extract(epoch from (t.first_assigned_at-t.created_at))/60)::numeric,1) AS avg_minutes_to_assignment,
-      round(avg(extract(epoch from (t.first_resolved_at-t.created_at))/60)::numeric,1) AS avg_minutes_to_resolution
+    ? queryJson(`SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('locality',locality,'tickets',tickets,'avg_minutes_to_assignment',avg_minutes_to_assignment,'avg_minutes_to_resolution',avg_minutes_to_resolution) ORDER BY tickets DESC,locality),'[]') FROM (
+      SELECT coalesce(r.locality,'N?o informada') AS locality,count(*) AS tickets,
+      round(avg(TIMESTAMPDIFF(MICROSECOND,t.created_at,t.first_assigned_at)/60000000),1) AS avg_minutes_to_assignment,
+      round(avg(TIMESTAMPDIFF(MICROSECOND,t.created_at,t.first_resolved_at)/60000000),1) AS avg_minutes_to_resolution
       FROM tickets t JOIN requests r ON r.id=t.request_id
-      WHERE t.synthetic=false AND r.synthetic=false AND r.created_at>=${sqlValue(settings.pilotStart)}::timestamptz AND r.created_at<${sqlValue(settings.pilotEnd)}::date + interval '1 day'
-      GROUP BY r.locality ORDER BY tickets DESC,locality) x`)
+      WHERE t.synthetic=false AND r.synthetic=false AND r.created_at>=${sqlValue(settings.pilotStart)} AND r.created_at<DATE_ADD(${sqlValue(settings.pilotEnd)}, INTERVAL 1 DAY)
+      GROUP BY r.locality) locality_metrics`)
     : [];
   return { windows: settings, baseline, pilot, locality };
 }
@@ -444,19 +729,15 @@ export function savePilotConfiguration(input = {}) {
       targets[kind][level] = value;
     }
   }
-  query(`INSERT INTO app_settings(key,value) VALUES('pilot_windows',${sqlValue(JSON.stringify(windows))}::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`);
-  query(`INSERT INTO app_settings(key,value) VALUES('pilot_sla_targets',${sqlValue(JSON.stringify(targets))}::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`);
+  query(`INSERT INTO app_settings(key,value) VALUES('pilot_windows',${sqlValue(JSON.stringify(windows))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`);
+  query(`INSERT INTO app_settings(key,value) VALUES('pilot_sla_targets',${sqlValue(JSON.stringify(targets))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`);
   return { windows, targets };
 }
 export function listIncidents() {
-  return queryJson(
-    `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT i.code AS id,i.code,i.title,i.system,i.category,i.severity,i.status,i.detected_at AS "detectedAt",coalesce((SELECT json_agg(it.ticket_id) FROM incident_tickets it WHERE it.incident_code=i.code),'[]'::json) AS "ticketIds" FROM incidents i ORDER BY detected_at DESC) x`,
-  );
+  return queryJson(`SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',i.code,'code',i.code,'title',i.title,'system',i.system,'category',i.category,'severity',i.severity,'status',i.status,'detectedAt',i.detected_at,'ticketIds',COALESCE((SELECT JSON_ARRAYAGG(it.ticket_id) FROM incident_tickets it WHERE it.incident_code=i.code),'[]')) ORDER BY i.detected_at DESC),'[]') FROM incidents i`);
 }
 export function listServiceLocalities(includeInactive = false) {
-  return queryJson(`SELECT coalesce(json_agg(x ORDER BY lower(x.name)),'[]'::json) FROM (
-    SELECT id,name,active,created_at AS "createdAt" FROM service_localities ${includeInactive ? '' : 'WHERE active'}
-  ) x`);
+  return queryJson(`SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',id,'name',name,'active',active,'createdAt',created_at) ORDER BY LOWER(name)),'[]') FROM service_localities ${includeInactive ? '' : 'WHERE active'}`);
 }
 export function serviceLocalityIsActive(name) {
   return query(`SELECT 1 FROM service_localities WHERE active AND lower(name)=lower(${sqlValue(String(name || '').trim())}) LIMIT 1`) === '1';
@@ -469,8 +750,8 @@ export function createServiceLocality(input) {
 }
 export function setServiceLocalityActive(id, active) {
   if (!/^\d+$/.test(String(id))) throw new Error('Município ou comarca inválido.');
-  const updated = queryJson(`UPDATE service_localities SET active=${active ? 'true' : 'false'},updated_at=now() WHERE id=${Number(id)} RETURNING json_build_object('id',id,'name',name,'active',active)`, null);
-  if (!updated) throw new Error('Município ou comarca não encontrado.');
+  query(`UPDATE service_localities SET active=${active ? 'true' : 'false'},updated_at=now() WHERE id=${Number(id)}`);
+  const updated = queryJson(`SELECT JSON_OBJECT('id',id,'name',name,'active',active) FROM service_localities WHERE id=${Number(id)} LIMIT 1`, null);
   return updated;
 }
 export function bootstrap(user = null) {
@@ -478,16 +759,20 @@ export function bootstrap(user = null) {
   const tickets = requester ? listTickets(user.id) : listTickets(),
     incidents = requester ? [] : listIncidents(),
     events = queryJson(
-      `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT type,request_id AS "requestId",knowledge_article_id AS "articleId",created_at AS "createdAt" FROM service_events ${requester ? `WHERE request_id IN (SELECT id FROM requests WHERE created_by=${sqlValue(user.id)}::uuid)` : ''} ORDER BY created_at DESC) x`,
+      `SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('type',type,'requestId',request_id,'articleId',knowledge_article_id,'createdAt',created_at) ORDER BY created_at DESC),'[]') FROM service_events ${requester ? `WHERE request_id IN (SELECT id FROM requests WHERE created_by=${sqlValue(user.id)}::uuid)` : ''}`,
     ),
     articles = queryJson(
-      `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT id,title,category,system,problem,solution,steps FROM knowledge_articles WHERE active ORDER BY id) x`,
+      `SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',id,'title',title,'category',category,'system',system,'problem',problem,'solution',solution,'steps',JSON_EXTRACT(steps,'$')) ORDER BY id),'[]') FROM knowledge_articles WHERE active`,
     );
-  return { tickets, incidents, events, articles, localities: listServiceLocalities() };
+  const triageQuestions = getTriageQuestionSettings();
+  const displayLabel = (code) => code.toLowerCase().split('_').map((part) => part.charAt(0).toUpperCase() + part.slice(1)).join(' ');
+  const categoryLabels = Object.fromEntries(Object.keys(triageQuestions.category?.criteria || {}).filter((code) => !CATEGORIES.includes(code)).map((code) => [code, displayLabel(code)]));
+  const systemLabels = Object.fromEntries(Object.keys(triageQuestions.system?.criteria || {}).filter((code) => !SYSTEMS.includes(code)).map((code) => [code, displayLabel(code)]));
+  return { tickets, incidents, events, articles, categoryLabels, systemLabels, supportProfile: getTriageConfiguration().supportProfile, localities: listServiceLocalities() };
 }
 export function createIncidentFor(ticket) {
   const related = queryJson(
-    `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT id FROM tickets WHERE synthetic=false AND system=${sqlValue(ticket.system)} AND category=${sqlValue(ticket.category)} AND created_at>=now()-interval '15 minutes' ORDER BY created_at) x`,
+    `SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',id) ORDER BY created_at),'[]') FROM tickets WHERE synthetic=false AND system=${sqlValue(ticket.system)} AND category=${sqlValue(ticket.category)} AND created_at>=now()-interval '15 minutes'`,
   );
   if (related.length < 3) return null;
   let code = query(
@@ -515,9 +800,7 @@ export function dashboard() {
   const recent = listTickets()
     .filter((t) => t.status === 'OPEN')
     .slice(0, 8);
-  const locality = queryJson(`SELECT coalesce(json_agg(x),'[]'::json) FROM (
-    SELECT r.locality,count(*)::int AS tickets FROM tickets t JOIN requests r ON r.id=t.request_id
-    WHERE t.synthetic=false GROUP BY r.locality ORDER BY tickets DESC,r.locality) x`);
+  const locality = queryJson(`SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('locality',locality,'tickets',tickets) ORDER BY tickets DESC,locality),'[]') FROM (SELECT r.locality,count(*) AS tickets FROM tickets t JOIN requests r ON r.id=t.request_id WHERE t.synthetic=false GROUP BY r.locality) locality_counts`);
   return { ...counts, recent, incidentList: listIncidents(), locality };
 }
 export function qualitySummary() {
@@ -528,13 +811,13 @@ export function qualitySummary() {
   'correctionCount',(SELECT count(*) FROM requests WHERE synthetic=false AND corrected_decision IS NOT NULL),
   'approvedCaseCount',(SELECT count(*) FROM evaluation_cases),
   'agreements',(SELECT json_build_object(
-    'category',json_build_object('agree',count(*) FILTER(WHERE decision->>'category'=corrected_decision->>'category'),'total',count(*)),
-    'system',json_build_object('agree',count(*) FILTER(WHERE decision->>'system'=corrected_decision->>'system'),'total',count(*)),
-    'impact',json_build_object('agree',count(*) FILTER(WHERE decision->>'impact'=corrected_decision->>'impact'),'total',count(*)),
-    'urgency',json_build_object('agree',count(*) FILTER(WHERE decision->>'urgency'=corrected_decision->>'urgency'),'total',count(*)),
-    'incident',json_build_object('agree',count(*) FILTER(WHERE decision->>'possibleIncident'=corrected_decision->>'possibleIncident'),'total',count(*))
+    'category',json_build_object('agree',SUM(CASE WHEN decision->>'category'=corrected_decision->>'category' THEN 1 ELSE 0 END),'total',count(*)),
+    'system',json_build_object('agree',SUM(CASE WHEN decision->>'system'=corrected_decision->>'system' THEN 1 ELSE 0 END),'total',count(*)),
+    'impact',json_build_object('agree',SUM(CASE WHEN decision->>'impact'=corrected_decision->>'impact' THEN 1 ELSE 0 END),'total',count(*)),
+    'urgency',json_build_object('agree',SUM(CASE WHEN decision->>'urgency'=corrected_decision->>'urgency' THEN 1 ELSE 0 END),'total',count(*)),
+    'incident',json_build_object('agree',SUM(CASE WHEN decision->>'possibleIncident'=corrected_decision->>'possibleIncident' THEN 1 ELSE 0 END),'total',count(*))
   ) FROM requests WHERE synthetic=false AND corrected_decision IS NOT NULL),
-  'corrections',(SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT r.id,r.description,r.decision AS original,r.corrected_decision AS corrected,r.corrected_at AS "correctedAt",r.correction_reason AS reason,(e.id IS NOT NULL) AS "evaluationCaseApproved" FROM requests r LEFT JOIN evaluation_cases e ON e.source_request_id=r.id WHERE r.synthetic=false AND r.corrected_decision IS NOT NULL ORDER BY r.corrected_at DESC LIMIT 30) x)
+  'corrections',(SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',c.id,'description',c.description,'original',JSON_EXTRACT(c.original,'$'),'corrected',JSON_EXTRACT(c.corrected,'$'),'correctedAt',c.correctedAt,'reason',c.reason,'evaluationCaseApproved',c.evaluationCaseApproved) ORDER BY c.correctedAt DESC),'[]') FROM (SELECT r.id,r.description,r.decision AS original,r.corrected_decision AS corrected,r.corrected_at AS correctedAt,r.correction_reason AS reason,(e.id IS NOT NULL) AS evaluationCaseApproved FROM requests r LEFT JOIN evaluation_cases e ON e.source_request_id=r.id WHERE r.synthetic=false AND r.corrected_decision IS NOT NULL ORDER BY r.corrected_at DESC LIMIT 30) c)
 )`);
   summary.benchmarkCaseCount = JSON.parse(
     fs.readFileSync(path.join(projectRoot, 'evaluation', 'cases.json'), 'utf8'),
@@ -543,7 +826,7 @@ export function qualitySummary() {
 }
 export function evaluationCases() {
   return queryJson(
-    `SELECT coalesce(json_agg(x),'[]'::json) FROM (SELECT id,source_request_id AS "sourceRequestId",text,expected FROM evaluation_cases ORDER BY id) x`,
+    `SELECT COALESCE(JSON_ARRAYAGG(JSON_OBJECT('id',id,'sourceRequestId',source_request_id,'text',text,'expected',JSON_EXTRACT(expected,'$')) ORDER BY id),'[]') FROM evaluation_cases`,
   );
 }
 export function getFeedbackEvaluationReport() {
@@ -554,7 +837,7 @@ export function getFeedbackEvaluationReport() {
 }
 export function saveFeedbackEvaluationReport(report) {
   query(
-    `INSERT INTO app_settings(key,value) VALUES('feedback_evaluation_latest',${sqlValue(JSON.stringify(report))}::jsonb) ON CONFLICT(key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
+    `INSERT INTO app_settings(key,value) VALUES('feedback_evaluation_latest',${sqlValue(JSON.stringify(report))}::jsonb) ON CONFLICT(tenant_id,key) DO UPDATE SET value=EXCLUDED.value,updated_at=now()`,
   );
   return report;
 }

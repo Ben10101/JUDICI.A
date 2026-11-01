@@ -1,5 +1,4 @@
-import { glpiConfig } from '../config.js';
-import { query, sqlValue } from '../postgres.js';
+import { query, sqlValue } from '../database.js';
 import { listTickets, recordTicketStatus } from '../repository.js';
 import { createGlpiV2Client } from './glpi-v2-client.js';
 
@@ -55,8 +54,8 @@ function relevance(article, description) {
   );
 }
 
-export function createGlpiV2Adapter() {
-  const client = createGlpiV2Client();
+export function createGlpiV2Adapter(glpiConfig) {
+  const client = createGlpiV2Client(glpiConfig);
 
   return {
     info,

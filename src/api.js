@@ -1,7 +1,8 @@
 import { randomUUID } from 'node:crypto';
 import { timingSafeEqual } from 'node:crypto';
-import { frontendOrigins as FRONTEND_ORIGINS, getGlpiSettings, saveGlpiSettings } from './config.js';
-import { query, queryJson, sqlValue } from './postgres.js';
+import { frontendOrigins as FRONTEND_ORIGINS } from './config.js';
+import { query, queryJson, sqlValue } from './database.js';
+import { setTenantContext } from './tenant-context.js';
 import {
   createSession,
   csrfCookie,
@@ -27,9 +28,17 @@ import {
   qualitySummary,
   evaluationCases,
   getFeedbackEvaluationReport,
-  getTriageQuestionSettings,
-  saveTriageQuestionSettings,
+  getTriageConfiguration,
+  normalizeTriageRouting,
+  normalizeTriageRoutingRules,
+  normalizeTriageCalibrationRules,
+  normalizeTriagePriorityMatrix,
+  normalizeTriageThresholdSettings,
+  saveTriageConfiguration,
   normalizeTriageQuestionSettings,
+  normalizeTriagePayloadTemplate,
+  normalizeSystemOptionMappings,
+  normalizeCategoryOptionMappings,
   triageBenchmarkCases,
   getPilotConfiguration,
   savePilotConfiguration,
@@ -42,6 +51,8 @@ import {
   createServiceLocality,
   setServiceLocalityActive,
   serviceLocalityIsActive,
+  getTenantTicketingSettings,
+  saveTenantTicketingSettings,
 } from './repository.js';
 import {
   applyAutomationGate,
@@ -64,11 +75,11 @@ function send(res, status, obj) {
   });
   res.end(JSON.stringify(obj));
 }
-async function bodyJson(req) {
+async function bodyJson(req, maxBytes = 12000) {
   let raw = '';
   for await (const chunk of req) {
     raw += chunk;
-    if (raw.length > 12000) throw new Error('Corpo da solicitação excede o limite.');
+    if (raw.length > maxBytes) throw new Error('Corpo da solicitação excede o limite.');
   }
   return raw ? JSON.parse(raw) : {};
 }
@@ -88,7 +99,7 @@ function originAllowed(origin) {
 
 function consumeLoginAttempt(req, email) {
   const now = Date.now();
-  const key = `${req.socket.remoteAddress || 'unknown'}:${String(email || '').trim().toLowerCase()}`;
+  const key = `${req.socket.remoteAddress || 'unknown'}:${String(email || '').trim().toLowerCase()}:${String(req.headers['x-tenant-slug'] || '').trim().toLowerCase()}`;
   let state = loginAttempts.get(key);
   if (!state || now - state.startedAt >= loginAttemptWindowMs) {
     state = { startedAt: now, attempts: 0 };
@@ -157,6 +168,9 @@ export async function handle(req, res) {
       return res.end();
     }
     if (url.pathname === '/api/health' && req.method === 'GET') {
+      let healthSession = null;
+      try { healthSession = getSession(req); } catch {}
+      if (healthSession) setTenantContext(healthSession.user.tenantId);
       let database = 'ok';
       try {
         query('SELECT 1');
@@ -177,7 +191,7 @@ export async function handle(req, res) {
         database,
         decisionProvider: provider,
         jevConfigured: configured,
-        automationApproved: process.env.TRIAGE_AUTOMATION_APPROVED === 'true',
+        automationApproved: getTriageConfiguration().automationApproved,
         ticketing: ticketingAdapter.info,
       });
     }
@@ -186,12 +200,14 @@ export async function handle(req, res) {
         return send(res, 403, { error: 'Origem do login não autorizada.' });
       const body = await bodyJson(req);
       const email = typeof body.email === 'string' ? body.email : '';
+      const tenantSlug = typeof body.tenantSlug === 'string' ? body.tenantSlug : '';
+      req.headers['x-tenant-slug'] = tenantSlug;
       if (!consumeLoginAttempt(req, email))
         return send(res, 429, { error: 'Muitas tentativas. Aguarde 15 minutos antes de tentar novamente.' });
-      const user = await verifyUserCredentials(email, body.password);
+      const user = await verifyUserCredentials(email, body.password, tenantSlug);
       if (!user) return send(res, 401, { error: 'E-mail ou senha inválidos.' });
       clearLoginAttempts(req, email);
-      const newSession = await createSession(user.id);
+      const newSession = await createSession(user.id, user.tenantId);
       res.setHeader('Set-Cookie', [
         sessionCookie(newSession.sessionToken, req),
         csrfCookie(newSession.csrfToken, req),
@@ -225,6 +241,7 @@ export async function handle(req, res) {
     const currentSession = getSession(req);
     if (!currentSession) return send(res, 401, { error: 'Faça login para continuar.' });
     const user = currentSession.user;
+    setTenantContext(user.tenantId);
     if (!roleCanAccess(user, url.pathname, req.method))
       return send(res, 403, { error: 'Seu perfil não tem acesso a este módulo.' });
     if (!['GET', 'HEAD', 'OPTIONS'].includes(req.method)) {
@@ -233,14 +250,11 @@ export async function handle(req, res) {
     }
     if (url.pathname === '/api/triage/settings' && req.method === 'GET')
       return send(res, 200, {
-        questions: getTriageQuestionSettings(),
-        requiresKey: Boolean(process.env.TRIAGE_SETTINGS_KEY),
+        ...getTriageConfiguration(),
       });
     if (url.pathname === '/api/triage/settings' && req.method === 'PUT') {
-      if (!triageSettingsAuthorized(req))
-        return send(res, 401, { error: 'Chave de configuração ausente ou inválida.' });
       try {
-        return send(res, 200, saveTriageQuestionSettings(await bodyJson(req)));
+        return send(res, 200, saveTriageConfiguration(await bodyJson(req, 64000)));
       } catch (error) {
         return send(res, 400, { error: error.message || 'NÃ£o foi possÃ­vel salvar as instruÃ§Ãµes.' });
       }
@@ -248,20 +262,27 @@ export async function handle(req, res) {
     if (url.pathname === '/api/triage/benchmark-cases' && req.method === 'GET')
       return send(res, 200, triageBenchmarkCases());
     if (url.pathname === '/api/triage/preview' && req.method === 'POST') {
-      if (!triageSettingsAuthorized(req))
-        return send(res, 401, { error: 'Informe a chave de configuração para executar a prévia.' });
-      const body = await bodyJson(req);
+      const body = await bodyJson(req, 64000);
       const description = String(body.description || '').trim();
       if (description.length < 8 || description.length > 1000)
         return send(res, 400, { error: 'O exemplo deve ter entre 8 e 1000 caracteres.' });
       try {
+        const current = getTriageConfiguration();
         const questions = normalizeTriageQuestionSettings(body.questions || {});
-        const evaluated = await classifyWithProvider(description, questions);
-        const decision = calibrateDecision(description, evaluated.decision);
-        const status = statusForDescription(description, decision);
+        const thresholds = normalizeTriageThresholdSettings(body.thresholds || current.thresholds);
+        const routing = normalizeTriageRouting(body.routing || current.routing);
+        const configuredCategories = Object.keys(questions.category.criteria);
+        const configuredSystems = Object.keys(questions.system.criteria);
+        const routingRules = normalizeTriageRoutingRules(body.routingRules || current.routingRules, configuredCategories, configuredSystems);
+        const calibrationRules = normalizeTriageCalibrationRules(body.calibrationRules || current.calibrationRules, configuredCategories, configuredSystems);
+        const priorityMatrix = normalizeTriagePriorityMatrix(body.priorityMatrix || current.priorityMatrix);
+        const payloadTemplate = normalizeTriagePayloadTemplate(body.payloadTemplate || current.payloadTemplate);
+        const evaluated = await classifyWithProvider(description, questions, { thresholds, calibrationRules, payloadTemplate, systemOptionMappings: normalizeSystemOptionMappings(body.systemOptionMappings || current.systemOptionMappings, questions.system.criteria), categoryOptionMappings: normalizeCategoryOptionMappings(body.categoryOptionMappings || current.categoryOptionMappings, questions.category.criteria) });
+        const decision = calibrateDecision(description, evaluated.decision, calibrationRules, configuredCategories, configuredSystems);
+        const status = statusForDescription(description, decision, thresholds, calibrationRules);
         const triageStatus = applyAutomationGate(
           { triageStatus: status },
-          process.env.TRIAGE_AUTOMATION_APPROVED === 'true',
+          body.automationApproved === true,
         ).triageStatus;
         const actual = {
           supportRequest: decision.isSupportRequest,
@@ -280,9 +301,10 @@ export async function handle(req, res) {
         return send(res, 200, {
           provider: evaluated.provider,
           decision,
+          modelChoices: evaluated.modelChoices || null,
           triageStatus,
-          priority: calculatePriority(decision),
-          queue: routeQueue(decision),
+          priority: calculatePriority(decision, priorityMatrix),
+          queue: routeQueue(decision, routing, routingRules),
           comparison,
         });
       } catch (error) {
@@ -314,10 +336,10 @@ export async function handle(req, res) {
       }
     }
     if (url.pathname === '/api/ticketing/settings' && req.method === 'GET')
-      return send(res, 200, getGlpiSettings());
+      return send(res, 200, getTenantTicketingSettings());
     if (url.pathname === '/api/ticketing/settings' && req.method === 'PUT') {
       try {
-        return send(res, 200, saveGlpiSettings(await bodyJson(req)));
+        return send(res, 200, saveTenantTicketingSettings(await bodyJson(req)));
       } catch (error) {
         return send(res, 400, { error: error.message || 'Não foi possível salvar as configurações.' });
       }
@@ -333,7 +355,7 @@ export async function handle(req, res) {
         const { name } = await bodyJson(req);
         return send(res, 201, createServiceLocality(name));
       } catch (error) {
-        const duplicate = /service_localities_name_lower_uidx|duplicate key/i.test(error.message);
+        const duplicate = /service_localities_(tenant_)?name_lower_uidx|service_localities_tenant_name_lower_uidx|duplicate key/i.test(error.message);
         return send(res, 400, { error: duplicate ? 'Esse município ou comarca já está cadastrado.' : error.message || 'Não foi possível cadastrar o município ou comarca.' });
       }
     }
@@ -421,7 +443,7 @@ export async function handle(req, res) {
           typeof row.corrected_decision === 'string'
             ? JSON.parse(row.corrected_decision)
             : row.corrected_decision;
-        expected = validateHumanDecision(correctedDecision);
+        expected = validateHumanDecision(correctedDecision, Object.keys(getTriageConfiguration().questions.category.criteria), Object.keys(getTriageConfiguration().questions.system.criteria));
       } catch {
         return send(res, 409, {
           error: 'A correção humana salva está incompleta ou inválida.',
@@ -470,21 +492,22 @@ export async function handle(req, res) {
         return send(res, 400, { error: 'Informe a comarca ou município (2 a 120 caracteres).' });
       if (!serviceLocalityIsActive(locality))
         return send(res, 400, { error: 'Selecione uma comarca ou município ativo na lista.' });
-      const evaluated = await classifyWithProvider(description, getTriageQuestionSettings()),
-        calibratedDecision = calibrateDecision(description, evaluated.decision);
+      const triageConfig = getTriageConfiguration();
+      const evaluated = await classifyWithProvider(description, triageConfig.questions, triageConfig),
+        calibratedDecision = calibrateDecision(description, evaluated.decision, triageConfig.calibrationRules, Object.keys(triageConfig.questions.category.criteria), Object.keys(triageConfig.questions.system.criteria));
       const calibrated = {
         ...evaluated,
         decision: calibratedDecision,
-        triageStatus: statusForDescription(description, calibratedDecision),
+        triageStatus: statusForDescription(description, calibratedDecision, triageConfig.thresholds, triageConfig.calibrationRules),
       };
       const result = applyAutomationGate(
         calibrated,
-        process.env.TRIAGE_AUTOMATION_APPROVED === 'true',
+        triageConfig.automationApproved,
       );
       const { provider, triageStatus } = result;
       const decision = result.decision;
-      const p = calculatePriority(decision),
-        q = routeQueue(decision),
+      const p = calculatePriority(decision, triageConfig.priorityMatrix),
+        q = routeQueue(decision, triageConfig.routing, triageConfig.routingRules),
         id = `REQ-${randomUUID().slice(0, 8).toUpperCase()}`;
       const matches =
           triageStatus === 'OUT_OF_SCOPE'
@@ -517,6 +540,7 @@ export async function handle(req, res) {
         review: triageStatus !== 'READY',
         automationGate: result.automationGate || null,
         modelConfidence: decision.confidence,
+        modelChoices: evaluated.modelChoices || null,
       });
     }
     const correctionMatch = url.pathname.match(/^\/api\/requests\/([^/]+)\/correction$/);
@@ -530,13 +554,12 @@ export async function handle(req, res) {
       if (!row) return send(res, 404, { error: 'Solicitação não encontrada.' });
       if (user.role === 'solicitante' && row.created_by !== user.id)
         return send(res, 404, { error: 'Request not found.' });
+      const config = getTriageConfiguration();
       if (row.triage_status === 'OUT_OF_SCOPE' && body.confirmSupport !== true)
-        return send(res, 409, {
-          error: 'Confirme que esta mensagem é uma solicitação de suporte de TIC.',
-        });
-      const decision = validateHumanDecision(body.decision || body),
-        p = calculatePriority(decision),
-        q = routeQueue(decision),
+        return send(res, 409, { error: `Confirme que esta mensagem pertence ao servi\u00e7o ${config.supportProfile.serviceName}.` });
+      const decision = validateHumanDecision(body.decision || body, Object.keys(config.questions.category.criteria), Object.keys(config.questions.system.criteria)),
+        p = calculatePriority(decision, config.priorityMatrix),
+        q = routeQueue(decision, config.routing, config.routingRules),
         matches = await ticketingAdapter.searchKnowledge({
           category: decision.category,
           system: decision.system,
@@ -637,8 +660,9 @@ export async function handle(req, res) {
           typeof r.corrected_decision === 'string'
             ? JSON.parse(r.corrected_decision)
             : r.corrected_decision || r.decision,
-        p = calculatePriority(d),
-        q = routeQueue(d);
+        config = getTriageConfiguration(),
+        p = calculatePriority(d, config.priorityMatrix),
+        q = routeQueue(d, config.routing, config.routingRules);
       const ticket = await ticketingAdapter.createTicket({
         request: r,
         decision: d,

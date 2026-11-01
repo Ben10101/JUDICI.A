@@ -14,6 +14,8 @@
         <h1 id="auth-title">Acesse sua conta</h1>
         <p>Entre com a conta fornecida pela administração do sistema.</p>
         <form id="login-form" autocomplete="on">
+          <label for="login-tenant">Identificador da organizacao</label>
+          <input id="login-tenant" name="tenantSlug" type="text" autocomplete="organization" maxlength="63" pattern="[A-Za-z0-9][A-Za-z0-9-]{1,61}[A-Za-z0-9]" placeholder="Ex.: empresa-exemplo" required />
           <label for="login-email">E-mail</label>
           <input id="login-email" name="email" type="email" autocomplete="username" maxlength="254" required />
           <label for="login-password">Senha</label>
